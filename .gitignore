@@ -22,6 +22,7 @@ data/vfs_bot.db
 data/screenshots/
 data/logs/
 data/session.json
+data/browser_profile
 
 # OS
 .DS_Store

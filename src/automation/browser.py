@@ -42,8 +42,10 @@ class BrowserManager:
                 "--disable-dev-shm-usage",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
+                "--disable-infobars",
                 "--window-size=1920,1080",
             ],
+            ignore_default_args=["--enable-automation"],  # Remove automation flag that shows the banner
             viewport={"width": 1920, "height": 1080},
             locale="pt-PT",
             timezone_id="Africa/Luanda",
