@@ -21,6 +21,7 @@ class BrowserManager:
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._session_file = settings.base_dir / "data" / "session.json"
+        self._user_data_dir = settings.base_dir / "data" / "browser_profile"
 
     async def start(self) -> Page:
         """Start browser and return page"""
@@ -28,47 +29,86 @@ class BrowserManager:
 
         self._playwright = await async_playwright().start()
 
-        # Launch browser with stealth arguments
-        self._browser = await self._playwright.chromium.launch(
+        # Use persistent context with real Chrome for better stealth
+        # This creates a real browser profile that persists between runs
+        self._user_data_dir.mkdir(parents=True, exist_ok=True)
+
+        self._context = await self._playwright.chromium.launch_persistent_context(
+            user_data_dir=str(self._user_data_dir),
             headless=settings.headless,
+            channel="chrome",  # Use real installed Chrome, not Playwright's Chromium
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
-                "--disable-web-security",
-                "--disable-features=IsolateOrigins,site-per-process",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
-                "--disable-accelerated-2d-canvas",
-                "--disable-gpu",
                 "--window-size=1920,1080",
             ],
-        )
-
-        # Create context with stealth settings
-        self._context = await self._browser.new_context(
             viewport={"width": 1920, "height": 1080},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            locale="en-US",
+            locale="pt-PT",
             timezone_id="Africa/Luanda",
-            geolocation={"latitude": -8.839988, "longitude": 13.289437},  # Luanda, Angola
+            geolocation={"latitude": -8.839988, "longitude": 13.289437},
             permissions=["geolocation"],
+            ignore_https_errors=True,
         )
 
-        # Add stealth scripts
+        # Apply stealth scripts
+        await self._apply_stealth()
+
+        # Load saved session if exists
+        await self._load_session()
+
+        # Use existing page or create new one
+        if self._context.pages:
+            self._page = self._context.pages[0]
+        else:
+            self._page = await self._context.new_page()
+
+        # Set default timeout
+        self._page.set_default_timeout(30000)
+
+        logger.info("Browser started successfully")
+        return self._page
+
+    async def _apply_stealth(self):
+        """Apply comprehensive stealth scripts to avoid detection"""
         await self._context.add_init_script("""
-            // Override webdriver property
+            // Override webdriver - most critical check
             Object.defineProperty(navigator, 'webdriver', {
                 get: () => undefined
             });
 
-            // Override plugins
+            // Fix plugins to look like real Chrome
             Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5]
+                get: () => {
+                    const plugins = [
+                        {
+                            name: 'Chrome PDF Plugin',
+                            description: 'Portable Document Format',
+                            filename: 'internal-pdf-viewer',
+                            length: 1,
+                        },
+                        {
+                            name: 'Chrome PDF Viewer',
+                            description: '',
+                            filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai',
+                            length: 1,
+                        },
+                        {
+                            name: 'Native Client',
+                            description: '',
+                            filename: 'internal-nacl-plugin',
+                            length: 2,
+                        },
+                    ];
+                    plugins.__proto__ = PluginArray.prototype;
+                    return plugins;
+                }
             });
 
             // Override languages
             Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-US', 'en', 'pt']
+                get: () => ['pt-PT', 'pt', 'en-US', 'en']
             });
 
             // Override platform
@@ -86,36 +126,130 @@ class BrowserManager:
                 get: () => 8
             });
 
+            // Override maxTouchPoints (desktop = 0)
+            Object.defineProperty(navigator, 'maxTouchPoints', {
+                get: () => 0
+            });
+
             // Remove automation indicators
             delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
             delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
             delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
 
-            // Override chrome
+            // Override chrome runtime
             window.chrome = {
-                runtime: {},
+                runtime: {
+                    PlatformOs: {
+                        MAC: 'mac',
+                        WIN: 'win',
+                        ANDROID: 'android',
+                        CROS: 'cros',
+                        LINUX: 'linux',
+                        OPENBSD: 'openbsd',
+                    },
+                    PlatformArch: {
+                        ARM: 'arm',
+                        X86_32: 'x86-32',
+                        X86_64: 'x86-64',
+                        MIPS: 'mips',
+                        MIPS64: 'mips64',
+                    },
+                    PlatformNaclArch: {
+                        ARM: 'arm',
+                        X86_32: 'x86-32',
+                        X86_64: 'x86-64',
+                        MIPS: 'mips',
+                        MIPS64: 'mips64',
+                    },
+                    RequestUpdateCheckStatus: {
+                        THROTTLED: 'throttled',
+                        NO_UPDATE: 'no_update',
+                        UPDATE_AVAILABLE: 'update_available',
+                    },
+                    OnInstalledReason: {
+                        INSTALL: 'install',
+                        UPDATE: 'update',
+                        CHROME_UPDATE: 'chrome_update',
+                        SHARED_MODULE_UPDATE: 'shared_module_update',
+                    },
+                    OnRestartRequiredReason: {
+                        APP_UPDATE: 'app_update',
+                        OS_UPDATE: 'os_update',
+                        PERIODIC: 'periodic',
+                    },
+                },
+                loadTimes: function() {
+                    return {
+                        requestTime: Date.now() / 1000 - Math.random() * 2,
+                        startLoadTime: Date.now() / 1000 - Math.random(),
+                        commitLoadTime: Date.now() / 1000 - Math.random() * 0.5,
+                        finishDocumentLoadTime: Date.now() / 1000,
+                        finishLoadTime: Date.now() / 1000,
+                        firstPaintTime: Date.now() / 1000 - Math.random() * 0.3,
+                        firstPaintAfterLoadTime: 0,
+                        navigationType: 'Other',
+                        wasFetchedViaSpdy: false,
+                        wasNpnNegotiated: true,
+                        npnNegotiatedProtocol: 'h2',
+                        wasAlternateProtocolAvailable: false,
+                        connectionInfo: 'h2',
+                    };
+                },
+                csi: function() {
+                    return {
+                        onloadT: Date.now(),
+                        startE: Date.now() - Math.random() * 1000,
+                        pageT: Math.random() * 3000,
+                    };
+                },
             };
 
-            // Override permissions
+            // Override permissions query
             const originalQuery = window.navigator.permissions.query;
             window.navigator.permissions.query = (parameters) => (
                 parameters.name === 'notifications' ?
                     Promise.resolve({ state: Notification.permission }) :
                     originalQuery(parameters)
             );
+
+            // Override WebGL vendor/renderer
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(param) {
+                if (param === 37445) return 'Google Inc. (NVIDIA)';
+                if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650, OpenGL 4.5)';
+                return getParameter.call(this, param);
+            };
+
+            // Override canvas fingerprint with subtle noise
+            const toBlob = HTMLCanvasElement.prototype.toBlob;
+            const toDataURL = HTMLCanvasElement.prototype.toDataURL;
+
+            HTMLCanvasElement.prototype.toBlob = function() {
+                const context = this.getContext('2d');
+                if (context) {
+                    const shift = {r: Math.floor(Math.random() * 3) - 1, g: Math.floor(Math.random() * 3) - 1, b: 0};
+                    const width = this.width, height = this.height;
+                    if (width && height) {
+                        const imageData = context.getImageData(0, 0, width, height);
+                        for (let i = 0; i < imageData.data.length; i += 4) {
+                            imageData.data[i] += shift.r;
+                            imageData.data[i+1] += shift.g;
+                        }
+                        context.putImageData(imageData, 0, 0);
+                    }
+                }
+                return toBlob.apply(this, arguments);
+            };
+
+            // Fix iframe contentWindow
+            try {
+                Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+                    get: function() {
+                        return window;
+                    }
+                });
+            } catch(e) {}
         """)
-
-        # Load saved session if exists
-        await self._load_session()
-
-        # Create new page
-        self._page = await self._context.new_page()
-
-        # Set default timeout
-        self._page.set_default_timeout(30000)
-
-        logger.info("Browser started successfully")
-        return self._page
 
     async def stop(self):
         """Stop browser and save session"""
@@ -125,16 +259,13 @@ class BrowserManager:
         await self._save_session()
 
         if self._page:
-            await self._page.close()
             self._page = None
 
         if self._context:
             await self._context.close()
             self._context = None
 
-        if self._browser:
-            await self._browser.close()
-            self._browser = None
+        self._browser = None
 
         if self._playwright:
             await self._playwright.stop()

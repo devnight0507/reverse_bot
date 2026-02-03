@@ -1,8 +1,9 @@
 """
-Login Automation - Handles VFS Global login process
+Login Automation - Handles VFS Global login process including OTP
 """
 import asyncio
-from typing import Optional, Tuple
+import re
+from typing import Optional, Tuple, Callable
 from playwright.async_api import Page
 from loguru import logger
 
@@ -12,11 +13,16 @@ from .turnstile import TurnstileSolver
 
 
 class LoginAutomation:
-    """Handles VFS Global login automation"""
+    """Handles VFS Global login automation with OTP support"""
 
     def __init__(self, browser: BrowserManager):
         self.browser = browser
         self.turnstile = TurnstileSolver()
+        self._otp_callback: Optional[Callable] = None
+
+    def set_otp_callback(self, callback: Callable):
+        """Set callback for OTP retrieval (e.g., from email or Telegram)"""
+        self._otp_callback = callback
 
     async def login(
         self,
@@ -24,11 +30,7 @@ class LoginAutomation:
         password: Optional[str] = None
     ) -> Tuple[bool, str]:
         """
-        Perform login to VFS Global
-
-        Args:
-            email: VFS account email (uses config if not provided)
-            password: VFS account password (uses config if not provided)
+        Perform login to VFS Global (handles email/password + OTP)
 
         Returns:
             Tuple of (success: bool, message: str)
@@ -46,9 +48,14 @@ class LoginAutomation:
         try:
             logger.info("Starting login process...")
 
+            # Navigate to VFS homepage first, then to login (more natural)
+            logger.info(f"Navigating to {VFSUrls.BASE}")
+            await page.goto(VFSUrls.BASE, wait_until="domcontentloaded", timeout=30000)
+            await self.browser.random_delay(2000, 4000)
+
             # Navigate to login page
             logger.info(f"Navigating to {VFSUrls.LOGIN}")
-            await page.goto(VFSUrls.LOGIN, wait_until="networkidle")
+            await page.goto(VFSUrls.LOGIN, wait_until="domcontentloaded", timeout=30000)
             await self.browser.random_delay(1000, 2000)
 
             # Handle cookie consent if present
@@ -61,7 +68,7 @@ class LoginAutomation:
 
             # Wait for login form
             logger.info("Waiting for login form...")
-            await page.wait_for_selector(Selectors.EMAIL_INPUT, timeout=15000)
+            await page.wait_for_selector(Selectors.EMAIL_INPUT, timeout=20000)
 
             # Enter email
             logger.info("Entering email...")
@@ -85,8 +92,16 @@ class LoginAutomation:
             # Click sign in button
             logger.info("Clicking sign in button...")
             await self.browser.human_click(Selectors.SIGN_IN_BUTTON)
+            await self.browser.random_delay(2000, 4000)
 
-            # Wait for navigation or error
+            # Check if OTP page appeared
+            if await self._is_otp_page(page):
+                logger.info("OTP page detected - 2FA required")
+                success, message = await self._handle_otp(page)
+                if not success:
+                    return False, message
+
+            # Wait for navigation result
             await self._wait_for_login_result(page)
 
             # Check if login was successful
@@ -105,6 +120,177 @@ class LoginAutomation:
             await self.browser.screenshot("login_error")
             return False, f"Login error: {str(e)}"
 
+    async def _is_otp_page(self, page: Page) -> bool:
+        """Check if the OTP/2FA page is showing"""
+        try:
+            # Check for OTP-related text
+            content = await page.content()
+            otp_indicators = [
+                "one time password",
+                "otp",
+                "verification code",
+                "enter your code",
+                "enviado por e-mail",  # Portuguese: sent by email
+            ]
+
+            content_lower = content.lower()
+            for indicator in otp_indicators:
+                if indicator in content_lower:
+                    return True
+
+            # Check for OTP input field
+            otp_input = await page.query_selector(Selectors.OTP_INPUT)
+            if otp_input and await otp_input.is_visible():
+                return True
+
+            return False
+        except:
+            return False
+
+    async def _handle_otp(self, page: Page) -> Tuple[bool, str]:
+        """Handle OTP/2FA step"""
+        logger.info("Handling OTP verification...")
+        await self.browser.screenshot("otp_page")
+
+        # Method 1: Try to read OTP from email automatically
+        otp_code = await self._read_otp_from_email()
+
+        # Method 2: Use callback if configured (e.g., Telegram prompt)
+        if not otp_code and self._otp_callback:
+            logger.info("Requesting OTP via callback...")
+            try:
+                otp_code = await self._otp_callback()
+            except Exception as e:
+                logger.error(f"OTP callback error: {e}")
+
+        # Method 3: Wait for user to enter OTP manually in the browser
+        if not otp_code:
+            logger.info("Waiting for manual OTP entry (120s timeout)...")
+            logger.info("Please enter the OTP code in the browser window")
+            success = await self._wait_for_manual_otp(page, timeout=120)
+            if success:
+                return True, "OTP entered manually"
+            return False, "OTP timeout - no code entered within 120 seconds"
+
+        # Enter the OTP code
+        logger.info(f"Entering OTP code...")
+        try:
+            # Find and fill OTP input
+            otp_input = await page.wait_for_selector(Selectors.OTP_INPUT, timeout=5000)
+            if otp_input:
+                await otp_input.click()
+                await self.browser.random_delay(200, 500)
+                await page.keyboard.type(otp_code, delay=80)
+                await self.browser.random_delay(500, 1000)
+
+                # Handle Turnstile on OTP page if present
+                if await self._has_turnstile(page):
+                    logger.info("Turnstile on OTP page, solving...")
+                    await self.turnstile.solve(page)
+                    await self.browser.random_delay(1000, 2000)
+
+                # Click submit
+                submit_btn = await page.query_selector(Selectors.OTP_SUBMIT)
+                if submit_btn:
+                    await submit_btn.click()
+                    await self.browser.random_delay(2000, 4000)
+
+                return True, "OTP submitted"
+            else:
+                return False, "OTP input field not found"
+        except Exception as e:
+            logger.error(f"OTP entry error: {e}")
+            return False, f"OTP entry error: {str(e)}"
+
+    async def _read_otp_from_email(self) -> Optional[str]:
+        """Try to read OTP code from email via IMAP"""
+        if not settings.smtp_user or not settings.smtp_password:
+            logger.info("Email not configured, skipping auto OTP read")
+            return None
+
+        try:
+            import imaplib
+            import email as email_lib
+            from datetime import datetime, timedelta
+
+            logger.info("Checking email for OTP code...")
+
+            # Connect to Gmail IMAP
+            imap = imaplib.IMAP4_SSL("imap.gmail.com")
+            imap.login(settings.smtp_user, settings.smtp_password)
+            imap.select("INBOX")
+
+            # Search for recent VFS emails (last 5 minutes)
+            date_str = (datetime.now() - timedelta(minutes=5)).strftime("%d-%b-%Y")
+            _, message_ids = imap.search(None, f'(SINCE "{date_str}" FROM "vfsglobal")')
+
+            if not message_ids[0]:
+                logger.info("No recent VFS emails found")
+                imap.logout()
+                return None
+
+            # Get the latest email
+            latest_id = message_ids[0].split()[-1]
+            _, msg_data = imap.fetch(latest_id, "(RFC822)")
+
+            msg = email_lib.message_from_bytes(msg_data[0][1])
+
+            # Extract body
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                        break
+                    elif part.get_content_type() == "text/html":
+                        body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+            else:
+                body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
+
+            imap.logout()
+
+            # Extract OTP code (typically 6 digits)
+            otp_match = re.search(r'\b(\d{6})\b', body)
+            if otp_match:
+                otp = otp_match.group(1)
+                logger.info(f"OTP code found in email: {otp[:2]}****")
+                return otp
+
+            # Try 4-digit OTP
+            otp_match = re.search(r'\b(\d{4})\b', body)
+            if otp_match:
+                otp = otp_match.group(1)
+                logger.info(f"OTP code found in email: {otp[:2]}**")
+                return otp
+
+            logger.info("Could not extract OTP from email body")
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to read OTP from email: {e}")
+            return None
+
+    async def _wait_for_manual_otp(self, page: Page, timeout: int = 120) -> bool:
+        """Wait for user to manually enter OTP in the browser"""
+        try:
+            # Wait for the page to navigate away from OTP (user enters code manually)
+            await page.wait_for_function(
+                """
+                () => {
+                    // Check if we moved past OTP page
+                    if (window.location.href.includes('/dashboard')) return true;
+                    // Check for error message
+                    const body = document.body.innerText.toLowerCase();
+                    if (!body.includes('one time password') && !body.includes('otp')) return true;
+                    return false;
+                }
+                """,
+                timeout=timeout * 1000,
+            )
+            return True
+        except:
+            return False
+
     async def logout(self) -> bool:
         """Logout from VFS Global"""
         page = self.browser.page
@@ -112,7 +298,6 @@ class LoginAutomation:
             return False
 
         try:
-            # Look for logout button or user menu
             logout_selectors = [
                 "button:has-text('Logout')",
                 "button:has-text('Sign Out')",
@@ -131,7 +316,6 @@ class LoginAutomation:
                 except:
                     continue
 
-            # If no logout button found, just clear session
             await page.context.clear_cookies()
             logger.info("Session cleared")
             return True
@@ -143,7 +327,6 @@ class LoginAutomation:
     async def _handle_cookie_consent(self, page: Page):
         """Handle cookie consent popup if present"""
         try:
-            # Try to reject all cookies for cleaner experience
             selectors = [
                 Selectors.COOKIE_REJECT,
                 "#onetrust-accept-btn-handler",
@@ -186,11 +369,9 @@ class LoginAutomation:
     async def _is_logged_in(self, page: Page) -> bool:
         """Check if user is logged in"""
         try:
-            # Check URL
             if "/dashboard" in page.url:
                 return True
 
-            # Check for dashboard elements
             dashboard_selectors = [
                 Selectors.NEW_BOOKING_BUTTON,
                 "text=Start New Booking",
@@ -217,9 +398,7 @@ class LoginAutomation:
             await page.wait_for_function(
                 """
                 () => {
-                    // Check for dashboard
                     if (window.location.href.includes('/dashboard')) return true;
-                    // Check for error message
                     if (document.querySelector('.alert-danger')) return true;
                     if (document.querySelector('.error-message')) return true;
                     return false;
@@ -228,7 +407,6 @@ class LoginAutomation:
                 timeout=timeout,
             )
         except:
-            # Timeout is ok, we'll check the result manually
             pass
 
         await self.browser.random_delay(1000, 2000)
@@ -265,11 +443,9 @@ class LoginAutomation:
             return False
 
         try:
-            # Navigate to dashboard
-            await page.goto(VFSUrls.DASHBOARD, wait_until="networkidle")
+            await page.goto(VFSUrls.DASHBOARD, wait_until="domcontentloaded", timeout=30000)
             await self.browser.random_delay(1000, 2000)
 
-            # Check if redirected to login
             if "/login" in page.url:
                 logger.info("Session expired, need to re-login")
                 return False

@@ -78,6 +78,11 @@ class Selectors:
     PASSWORD_INPUT = "#mat-input-1"
     SIGN_IN_BUTTON = "button[type='submit']"
 
+    # OTP (2FA) Page
+    OTP_INPUT = "input[formcontrolname='otp'], input[type='text'][placeholder*='OTP'], input[type='password']"
+    OTP_SUBMIT = "button[type='submit']"
+    OTP_HEADING = "text=one time password"
+
     # Cookie Consent
     COOKIE_REJECT = "#onetrust-reject-all-handler"
 
