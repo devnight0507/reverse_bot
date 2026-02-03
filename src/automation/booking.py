@@ -28,7 +28,7 @@ class BookingAutomation:
 
             # Navigate to dashboard if not there
             if "/dashboard" not in page.url:
-                await page.goto(VFSUrls.DASHBOARD, wait_until="networkidle")
+                await page.goto(VFSUrls.DASHBOARD, wait_until="domcontentloaded", timeout=30000)
                 await self.browser.random_delay(1000, 2000)
 
             # Click "Start New Booking" button

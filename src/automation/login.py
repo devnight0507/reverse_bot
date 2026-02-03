@@ -48,15 +48,32 @@ class LoginAutomation:
         try:
             logger.info("Starting login process...")
 
+            # Clear stale session data to avoid "Session Expired" page
+            await self._handle_stale_session(page)
+
             # Navigate to VFS homepage first, then to login (more natural)
             logger.info(f"Navigating to {VFSUrls.BASE}")
             await page.goto(VFSUrls.BASE, wait_until="domcontentloaded", timeout=30000)
             await self.browser.random_delay(2000, 4000)
 
+            # Check for "Session Expired" or "page-not-found" page
+            if await self._is_session_expired_page(page):
+                logger.info("Session expired page detected, clearing cookies and retrying...")
+                await page.context.clear_cookies()
+                await page.goto(VFSUrls.BASE, wait_until="domcontentloaded", timeout=30000)
+                await self.browser.random_delay(2000, 4000)
+
             # Navigate to login page
             logger.info(f"Navigating to {VFSUrls.LOGIN}")
             await page.goto(VFSUrls.LOGIN, wait_until="domcontentloaded", timeout=30000)
             await self.browser.random_delay(1000, 2000)
+
+            # Check again for session expired after navigating to login
+            if await self._is_session_expired_page(page):
+                logger.info("Session expired on login page, clearing all data...")
+                await page.context.clear_cookies()
+                await page.goto(VFSUrls.LOGIN, wait_until="domcontentloaded", timeout=30000)
+                await self.browser.random_delay(2000, 4000)
 
             # Handle cookie consent if present
             await self._handle_cookie_consent(page)
@@ -290,6 +307,41 @@ class LoginAutomation:
             return True
         except:
             return False
+
+    async def _is_session_expired_page(self, page: Page) -> bool:
+        """Check if current page is the 'Session Expired' or 'page-not-found' page"""
+        try:
+            url = page.url.lower()
+            if "page-not-found" in url:
+                return True
+
+            content = await page.content()
+            content_lower = content.lower()
+            expired_indicators = [
+                "session expired",
+                "session invalid",
+                "sessão expirada",
+                "go back to home",
+            ]
+            for indicator in expired_indicators:
+                if indicator in content_lower:
+                    return True
+
+            return False
+        except:
+            return False
+
+    async def _handle_stale_session(self, page: Page):
+        """Clear stale session data that causes 'Session Expired' errors"""
+        try:
+            # Delete old session file
+            session_file = self.browser._session_file
+            if session_file.exists():
+                import os
+                os.remove(session_file)
+                logger.info("Cleared stale session file")
+        except Exception as e:
+            logger.debug(f"Session cleanup: {e}")
 
     async def logout(self) -> bool:
         """Logout from VFS Global"""
