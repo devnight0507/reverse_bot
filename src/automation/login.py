@@ -68,7 +68,7 @@ class LoginAutomation:
             logger.info("Clicking 'Book now' button...")
             book_now_btn = await page.query_selector("a.lets-get-started, a:has-text('Book now'), a:has-text('Book Now')")
             if book_now_btn:
-                await book_now_btn.click()
+                await book_now_btn.click(force=True)  # force=True bypasses visibility checks
                 await self.browser.random_delay(3000, 5000)
             else:
                 logger.warning("Book now button not found, trying direct login URL...")
@@ -419,23 +419,33 @@ class LoginAutomation:
     async def _handle_cookie_consent(self, page: Page):
         """Handle cookie consent popup if present"""
         try:
+            # Wait for cookie banner to appear
+            try:
+                await page.wait_for_selector("#onetrust-banner-sdk", timeout=5000)
+                logger.info("Cookie banner detected")
+            except:
+                logger.debug("No cookie banner found")
+                return
+
             selectors = [
-                Selectors.COOKIE_REJECT,
-                "#onetrust-accept-btn-handler",
-                "button:has-text('Reject All')",
-                "button:has-text('Accept')",
+                "#onetrust-accept-btn-handler",        # Aceitar todos os cookies (confirmed)
+                "#onetrust-reject-all-handler",        # Rejeitar Todos
+                "button:has-text('Aceitar todos')",    # Portuguese accept
+                "button:has-text('Rejeitar Todos')",   # Portuguese reject
             ]
 
             for selector in selectors:
                 try:
                     button = await page.query_selector(selector)
-                    if button and await button.is_visible():
-                        await button.click()
-                        logger.info("Cookie consent handled")
-                        await self.browser.random_delay(500, 1000)
+                    if button:
+                        await button.click(force=True)
+                        logger.info(f"Cookie consent handled with: {selector}")
+                        await self.browser.random_delay(1000, 2000)
                         return
                 except:
                     continue
+
+            logger.warning("Cookie banner found but no buttons matched")
 
         except Exception as e:
             logger.debug(f"Cookie consent handling: {e}")

@@ -48,14 +48,14 @@ class NotificationService:
         try:
             import httpx
 
-            # Format message
+            # Format message (plain text - no Markdown to avoid parse errors)
             if title:
-                text = f"*{title}*\n\n{message}"
+                text = f"[ {title} ]\n\n{message}"
             else:
                 text = message
 
             # Add timestamp
-            text += f"\n\n_{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_"
+            text += f"\n\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
             url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
 
@@ -65,7 +65,6 @@ class NotificationService:
                     json={
                         "chat_id": settings.telegram_chat_id,
                         "text": text,
-                        "parse_mode": "Markdown",
                     },
                     timeout=10,
                 )
