@@ -48,26 +48,32 @@ class LoginAutomation:
         try:
             logger.info("Starting login process...")
 
-            # Step 1: Navigate to homepage to let Angular app initialize
-            logger.info(f"Navigating to {VFSUrls.BASE}")
-            await page.goto(VFSUrls.BASE, wait_until="domcontentloaded", timeout=30000)
+            # Step 1: Navigate to "Book an appointment" page
+            logger.info(f"Navigating to {VFSUrls.BOOK_APPOINTMENT}")
+            await page.goto(VFSUrls.BOOK_APPOINTMENT, wait_until="domcontentloaded", timeout=30000)
             await self.browser.random_delay(3000, 5000)
 
-            # Handle cookie consent on homepage
+            # Handle cookie consent
             await self._handle_cookie_consent(page)
 
             # If session expired page, clear storage and reload
             if await self._is_session_expired_page(page):
                 logger.info("Session expired page detected, clearing storage...")
                 await self._clear_all_storage(page)
-                await page.goto(VFSUrls.BASE, wait_until="domcontentloaded", timeout=30000)
+                await page.goto(VFSUrls.BOOK_APPOINTMENT, wait_until="domcontentloaded", timeout=30000)
                 await self.browser.random_delay(3000, 5000)
                 await self._handle_cookie_consent(page)
 
-            # Step 2: Navigate to /application-detail which redirects to /login via Angular auth guard
-            logger.info(f"Navigating to {VFSUrls.APPLICATION_DETAIL} (triggers login redirect)")
-            await page.goto(VFSUrls.APPLICATION_DETAIL, wait_until="domcontentloaded", timeout=30000)
-            await self.browser.random_delay(3000, 5000)
+            # Step 2: Click "Book now" button to trigger Angular router navigation to /login
+            logger.info("Clicking 'Book now' button...")
+            book_now_btn = await page.query_selector("a.lets-get-started, a:has-text('Book now'), a:has-text('Book Now')")
+            if book_now_btn:
+                await book_now_btn.click()
+                await self.browser.random_delay(3000, 5000)
+            else:
+                logger.warning("Book now button not found, trying direct login URL...")
+                await page.goto(VFSUrls.LOGIN, wait_until="domcontentloaded", timeout=30000)
+                await self.browser.random_delay(3000, 5000)
 
             logger.info(f"Current URL: {page.url}")
             await self.browser.screenshot("login_page_loaded")
