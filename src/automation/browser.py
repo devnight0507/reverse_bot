@@ -37,12 +37,16 @@ class BrowserManager:
             user_data_dir=str(self._user_data_dir),
             headless=settings.headless,
             channel="chrome",  # Use real installed Chrome, not Playwright's Chromium
+            chromium_sandbox=False,  # Disable sandbox properly (avoids --disable-setuid-sandbox warning)
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--window-size=1920,1080",
             ],
-            ignore_default_args=["--enable-automation"],  # Remove automation flag that shows the banner
+            ignore_default_args=[
+                "--enable-automation",       # Removes "controlled by automation" banner
+                "--disable-setuid-sandbox",  # Removes unsupported flag warning on Windows
+            ],
             viewport={"width": 1920, "height": 1080},
             locale="pt-PT",
             timezone_id="Africa/Luanda",
