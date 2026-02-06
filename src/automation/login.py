@@ -48,32 +48,81 @@ class LoginAutomation:
         try:
             logger.info("Starting login process...")
 
-            # Step 1: Navigate to "Book an appointment" page
-            logger.info(f"Navigating to {VFSUrls.BOOK_APPOINTMENT}")
-            await page.goto(VFSUrls.BOOK_APPOINTMENT, wait_until="domcontentloaded", timeout=30000)
-            await self.browser.random_delay(3000, 5000)
+            # Step 1: Navigate to "Book an appointment" page (with retry for Cloudflare 403)
+            max_retries = 3
+            page_loaded = False
 
-            # Handle cookie consent
-            await self._handle_cookie_consent(page)
-
-            # If session expired page, clear storage and reload
-            if await self._is_session_expired_page(page):
-                logger.info("Session expired page detected, clearing storage...")
-                await self._clear_all_storage(page)
+            for attempt in range(1, max_retries + 1):
+                logger.info(f"Navigating to {VFSUrls.BOOK_APPOINTMENT} (attempt {attempt}/{max_retries})")
                 await page.goto(VFSUrls.BOOK_APPOINTMENT, wait_until="domcontentloaded", timeout=30000)
-                await self.browser.random_delay(3000, 5000)
+
+                # Wait for Angular SPA to fully render
+                await self.browser.random_delay(5000, 8000)
+
+                # Check if Cloudflare blocked us (403201 JSON response)
+                if await self._is_blocked_page(page):
+                    logger.warning(f"Cloudflare 403 detected (attempt {attempt}/{max_retries})")
+                    if attempt < max_retries:
+                        # Wait longer before retry (exponential backoff)
+                        wait_time = 10 * attempt
+                        logger.info(f"Waiting {wait_time}s before retry...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error("All attempts blocked by Cloudflare")
+                        await self.browser.screenshot("cloudflare_blocked")
+                        return False, "Blocked by Cloudflare protection. Try again later."
+
+                # If session expired page, clear storage and reload
+                if await self._is_session_expired_page(page):
+                    logger.info("Session expired page detected, clearing storage...")
+                    await self._clear_all_storage(page)
+                    await page.goto(VFSUrls.BOOK_APPOINTMENT, wait_until="domcontentloaded", timeout=30000)
+                    await self.browser.random_delay(5000, 8000)
+
+                # Handle cookie consent
                 await self._handle_cookie_consent(page)
 
+                page_loaded = True
+                break
+
+            if not page_loaded:
+                return False, "Failed to load VFS page after retries"
+
             # Step 2: Click "Book now" button to trigger Angular router navigation to /login
-            logger.info("Clicking 'Book now' button...")
-            book_now_btn = await page.query_selector("a.lets-get-started, a:has-text('Book now'), a:has-text('Book Now')")
+            # Use wait_for_selector instead of query_selector to give Angular time to render
+            logger.info("Waiting for 'Book now' button...")
+            book_now_selectors = [
+                "a.lets-get-started",
+                "a:has-text('Book now')",
+                "a:has-text('Book Now')",
+                "a:has-text('Reservar agora')",
+            ]
+
+            book_now_btn = None
+            for selector in book_now_selectors:
+                try:
+                    book_now_btn = await page.wait_for_selector(selector, timeout=10000)
+                    if book_now_btn:
+                        logger.info(f"Book now button found with: {selector}")
+                        break
+                except:
+                    continue
+
             if book_now_btn:
-                await book_now_btn.click(force=True)  # force=True bypasses visibility checks
+                await book_now_btn.click(force=True)
+                logger.info("Clicked 'Book now' button, waiting for login page...")
                 await self.browser.random_delay(3000, 5000)
             else:
-                logger.warning("Book now button not found, trying direct login URL...")
+                logger.warning("Book now button not found after waiting, trying direct login URL...")
                 await page.goto(VFSUrls.LOGIN, wait_until="domcontentloaded", timeout=30000)
-                await self.browser.random_delay(3000, 5000)
+                await self.browser.random_delay(5000, 8000)
+
+                # Check if direct login URL also got blocked
+                if await self._is_blocked_page(page):
+                    logger.error("Direct login URL also blocked by Cloudflare")
+                    await self.browser.screenshot("login_blocked")
+                    return False, "Blocked by Cloudflare protection. Try again later."
 
             logger.info(f"Current URL: {page.url}")
             await self.browser.screenshot("login_page_loaded")
@@ -333,6 +382,29 @@ class LoginAutomation:
                 timeout=timeout * 1000,
             )
             return True
+        except:
+            return False
+
+    async def _is_blocked_page(self, page: Page) -> bool:
+        """Check if Cloudflare/VFS WAF blocked the request (403201 JSON response)"""
+        try:
+            content = await page.content()
+            content_lower = content.lower()
+
+            # Check for 403201 JSON response
+            if '"403201"' in content or '"code":"403201"' in content.replace(" ", ""):
+                return True
+
+            # Check for Cloudflare block page indicators
+            if "access denied" in content_lower and "cloudflare" in content_lower:
+                return True
+
+            # Check for empty/minimal page (Cloudflare may return very little HTML)
+            body_text = await page.evaluate("() => document.body?.innerText?.trim() || ''")
+            if body_text and body_text.startswith('{"code"'):
+                return True
+
+            return False
         except:
             return False
 

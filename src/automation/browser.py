@@ -281,7 +281,7 @@ class BrowserManager:
     async def wait_for_navigation(self, timeout: int = 30000):
         """Wait for navigation to complete"""
         if self._page:
-            await self._page.wait_for_load_state("networkidle", timeout=timeout)
+            await self._page.wait_for_load_state("domcontentloaded", timeout=timeout)
 
     async def random_delay(self, min_ms: int = 500, max_ms: int = 1500):
         """Add random human-like delay"""
