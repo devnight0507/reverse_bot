@@ -110,20 +110,70 @@ class LoginAutomation:
                     continue
 
             if book_now_btn:
-                await book_now_btn.click(force=True)
-                logger.info("Clicked 'Book now' button, waiting for login page...")
-                await self.browser.random_delay(3000, 5000)
+                # IMPORTANT: Do NOT use force=True - it bypasses Angular's event handlers
+                # Angular needs to handle the click to do client-side routing (no new HTTP request)
+                # A direct HTTP request to /login gets blocked by Cloudflare (403201)
+                try:
+                    await book_now_btn.click()
+                    logger.info("Clicked 'Book now' button (normal click)")
+                except Exception as click_err:
+                    logger.warning(f"Normal click failed ({click_err}), trying JS click...")
+                    # JS click preserves Angular event handling
+                    await page.evaluate("document.querySelector('a.lets-get-started')?.click()")
+
+                # Wait for Angular router to navigate to /login
+                logger.info("Waiting for Angular router to navigate to /login...")
+                try:
+                    await page.wait_for_url("**/login**", timeout=10000)
+                    logger.info(f"Navigated to login page: {page.url}")
+                except:
+                    logger.warning(f"URL didn't change to /login. Current URL: {page.url}")
+                    # If URL didn't change, try JS-based Angular navigation
+                    if "/login" not in page.url:
+                        logger.info("Trying JavaScript navigation within Angular...")
+                        await page.evaluate("""
+                            () => {
+                                // Try Angular router navigation
+                                const router = window.ng?.getComponent(document.querySelector('app-root'))?.router;
+                                if (router) {
+                                    router.navigate(['/login']);
+                                    return;
+                                }
+                                // Fallback: simulate link click via JS
+                                const link = document.querySelector('a.lets-get-started') ||
+                                             document.querySelector('a[href*="login"]');
+                                if (link) {
+                                    link.click();
+                                    return;
+                                }
+                                // Last resort: use Angular's Location service via URL change
+                                window.history.pushState({}, '', '/ago/en/prt/login');
+                                window.dispatchEvent(new PopStateEvent('popstate'));
+                            }
+                        """)
+                        await self.browser.random_delay(3000, 5000)
+
+                    # If still not on login page, try direct navigation as last resort
+                    if "/login" not in page.url:
+                        logger.warning("Angular navigation failed, trying direct URL (may get 403)...")
+                        await page.goto(VFSUrls.LOGIN, wait_until="domcontentloaded", timeout=30000)
+                        await self.browser.random_delay(3000, 5000)
+
+                        if await self._is_blocked_page(page):
+                            logger.error("Direct login URL blocked by Cloudflare")
+                            await self.browser.screenshot("login_blocked")
+                            return False, "Blocked by Cloudflare. Try again later."
             else:
-                logger.warning("Book now button not found after waiting, trying direct login URL...")
+                logger.warning("Book now button not found, trying direct login URL...")
                 await page.goto(VFSUrls.LOGIN, wait_until="domcontentloaded", timeout=30000)
                 await self.browser.random_delay(5000, 8000)
 
-                # Check if direct login URL also got blocked
                 if await self._is_blocked_page(page):
                     logger.error("Direct login URL also blocked by Cloudflare")
                     await self.browser.screenshot("login_blocked")
                     return False, "Blocked by Cloudflare protection. Try again later."
 
+            await self.browser.random_delay(2000, 3000)
             logger.info(f"Current URL: {page.url}")
             await self.browser.screenshot("login_page_loaded")
 
