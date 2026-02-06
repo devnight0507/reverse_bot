@@ -110,11 +110,15 @@ class LoginAutomation:
                     continue
 
             if book_now_btn:
+                # Remove any lingering cookie overlays before clicking
+                await self._remove_cookie_overlays(page)
+                await self.browser.random_delay(500, 1000)
+
                 # IMPORTANT: Do NOT use force=True - it bypasses Angular's event handlers
                 # Angular needs to handle the click to do client-side routing (no new HTTP request)
                 # A direct HTTP request to /login gets blocked by Cloudflare (403201)
                 try:
-                    await book_now_btn.click()
+                    await book_now_btn.click(timeout=10000)
                     logger.info("Clicked 'Book now' button (normal click)")
                 except Exception as click_err:
                     logger.warning(f"Normal click failed ({click_err}), trying JS click...")
@@ -539,38 +543,68 @@ class LoginAutomation:
             return False
 
     async def _handle_cookie_consent(self, page: Page):
-        """Handle cookie consent popup if present"""
+        """Handle cookie consent popup/overlay if present"""
         try:
-            # Wait for cookie banner to appear
+            # Wait for any OneTrust element (banner OR overlay)
             try:
-                await page.wait_for_selector("#onetrust-banner-sdk", timeout=5000)
-                logger.info("Cookie banner detected")
+                await page.wait_for_selector(
+                    "#onetrust-banner-sdk, #onetrust-consent-sdk, .onetrust-pc-dark-filter",
+                    timeout=8000
+                )
+                logger.info("Cookie consent element detected")
             except:
-                logger.debug("No cookie banner found")
+                logger.debug("No cookie consent elements found")
                 return
 
-            selectors = [
-                "#onetrust-accept-btn-handler",        # Aceitar todos os cookies (confirmed)
-                "#onetrust-reject-all-handler",        # Rejeitar Todos
-                "button:has-text('Aceitar todos')",    # Portuguese accept
-                "button:has-text('Rejeitar Todos')",   # Portuguese reject
+            # Try clicking accept/reject buttons
+            button_selectors = [
+                "#onetrust-accept-btn-handler",
+                "#onetrust-reject-all-handler",
+                "#accept-recommended-btn-handler",
+                "button:has-text('Aceitar todos')",
+                "button:has-text('Accept All')",
+                "button:has-text('Rejeitar Todos')",
             ]
 
-            for selector in selectors:
+            button_clicked = False
+            for selector in button_selectors:
                 try:
                     button = await page.query_selector(selector)
                     if button:
                         await button.click(force=True)
                         logger.info(f"Cookie consent handled with: {selector}")
                         await self.browser.random_delay(1000, 2000)
-                        return
+                        button_clicked = True
+                        break
                 except:
                     continue
 
-            logger.warning("Cookie banner found but no buttons matched")
+            # Always remove blocking overlays via JS (even if button was clicked)
+            await self._remove_cookie_overlays(page)
+
+            if not button_clicked:
+                logger.warning("No cookie buttons matched, overlays removed via JS")
 
         except Exception as e:
             logger.debug(f"Cookie consent handling: {e}")
+
+    async def _remove_cookie_overlays(self, page: Page):
+        """Remove OneTrust cookie overlays that block clicks"""
+        try:
+            await page.evaluate("""
+                () => {
+                    // Remove dark overlay filter
+                    document.querySelectorAll('.onetrust-pc-dark-filter').forEach(el => el.remove());
+                    // Hide the entire consent SDK if banner was dismissed
+                    const sdk = document.getElementById('onetrust-consent-sdk');
+                    if (sdk) sdk.style.display = 'none';
+                    // Remove any other blocking overlays
+                    document.querySelectorAll('[class*="onetrust"][class*="filter"]').forEach(el => el.remove());
+                }
+            """)
+            logger.debug("Cookie overlays removed")
+        except Exception as e:
+            logger.debug(f"Overlay removal: {e}")
 
     async def _has_turnstile(self, page: Page) -> bool:
         """Check if Turnstile captcha is present"""
