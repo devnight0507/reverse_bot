@@ -65,6 +65,7 @@ class VFSUrls:
     """VFS Global Portugal (Angola) URLs"""
     BASE = "https://visa.vfsglobal.com/ago/en/prt"
     LOGIN = f"{BASE}/login"
+    APPLICATION_DETAIL = f"{BASE}/application-detail"  # Redirects to /login via Angular auth guard
     DASHBOARD = f"{BASE}/dashboard"
     BOOK_APPOINTMENT = f"{BASE}/book-an-appointment"
 

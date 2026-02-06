@@ -48,35 +48,66 @@ class LoginAutomation:
         try:
             logger.info("Starting login process...")
 
-            # Clear all stale data first
-            await self._clear_all_storage(page)
+            # Step 1: Navigate to homepage to let Angular app initialize
+            logger.info(f"Navigating to {VFSUrls.BASE}")
+            await page.goto(VFSUrls.BASE, wait_until="domcontentloaded", timeout=30000)
+            await self.browser.random_delay(3000, 5000)
 
-            # Navigate directly to login page
-            logger.info(f"Navigating to {VFSUrls.LOGIN}")
-            await page.goto(VFSUrls.LOGIN, wait_until="domcontentloaded", timeout=30000)
-            await self.browser.random_delay(2000, 4000)
-
-            # If we hit "Session Expired" page, do a full clear and retry
-            if await self._is_session_expired_page(page):
-                logger.info("Session expired page detected, doing full clear...")
-                await self._clear_all_storage(page)
-                # Navigate to homepage first, then login
-                await page.goto(VFSUrls.BASE, wait_until="domcontentloaded", timeout=30000)
-                await self.browser.random_delay(2000, 3000)
-                await page.goto(VFSUrls.LOGIN, wait_until="domcontentloaded", timeout=30000)
-                await self.browser.random_delay(2000, 4000)
-
-            # Handle cookie consent if present
+            # Handle cookie consent on homepage
             await self._handle_cookie_consent(page)
+
+            # If session expired page, clear storage and reload
+            if await self._is_session_expired_page(page):
+                logger.info("Session expired page detected, clearing storage...")
+                await self._clear_all_storage(page)
+                await page.goto(VFSUrls.BASE, wait_until="domcontentloaded", timeout=30000)
+                await self.browser.random_delay(3000, 5000)
+                await self._handle_cookie_consent(page)
+
+            # Step 2: Navigate to /application-detail which redirects to /login via Angular auth guard
+            logger.info(f"Navigating to {VFSUrls.APPLICATION_DETAIL} (triggers login redirect)")
+            await page.goto(VFSUrls.APPLICATION_DETAIL, wait_until="domcontentloaded", timeout=30000)
+            await self.browser.random_delay(3000, 5000)
+
+            logger.info(f"Current URL: {page.url}")
+            await self.browser.screenshot("login_page_loaded")
 
             # Check if already logged in
             if await self._is_logged_in(page):
                 logger.info("Already logged in")
                 return True, "Already logged in"
 
-            # Wait for login form
+            # Wait for login form with multiple possible selectors
             logger.info("Waiting for login form...")
-            await page.wait_for_selector(Selectors.EMAIL_INPUT, timeout=20000)
+            login_selectors = [
+                Selectors.EMAIL_INPUT,
+                "input[type='email']",
+                "input[formcontrolname='username']",
+                "input[formcontrolname='email']",
+                "input[placeholder*='mail']",
+                "input[placeholder*='Mail']",
+            ]
+
+            login_form_found = False
+            for selector in login_selectors:
+                try:
+                    await page.wait_for_selector(selector, timeout=5000)
+                    logger.info(f"Login form found with selector: {selector}")
+                    # Update the selector for this session
+                    Selectors.EMAIL_INPUT = selector
+                    login_form_found = True
+                    break
+                except:
+                    continue
+
+            if not login_form_found:
+                # Take screenshot of what's actually showing
+                await self.browser.screenshot("login_form_not_found")
+                logger.error(f"Login form not found. Current URL: {page.url}")
+                # Log page content for debugging
+                title = await page.title()
+                logger.error(f"Page title: {title}")
+                return False, f"Login form not found. URL: {page.url}"
 
             # Enter email
             logger.info("Entering email...")

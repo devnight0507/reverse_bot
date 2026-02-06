@@ -21,7 +21,6 @@ class BrowserManager:
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._session_file = settings.base_dir / "data" / "session.json"
-        self._user_data_dir = settings.base_dir / "data" / "browser_profile"
 
     async def start(self) -> Page:
         """Start browser and return page"""
@@ -29,24 +28,19 @@ class BrowserManager:
 
         self._playwright = await async_playwright().start()
 
-        # Use persistent context with real Chrome for better stealth
-        # This creates a real browser profile that persists between runs
-        self._user_data_dir.mkdir(parents=True, exist_ok=True)
-
-        self._context = await self._playwright.chromium.launch_persistent_context(
-            user_data_dir=str(self._user_data_dir),
+        # Launch browser (separate launch + context for clean control)
+        self._browser = await self._playwright.chromium.launch(
             headless=settings.headless,
-            channel="chrome",  # Use real installed Chrome, not Playwright's Chromium
-            chromium_sandbox=False,  # Disable sandbox properly (avoids --disable-setuid-sandbox warning)
+            channel="chrome",
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--window-size=1920,1080",
             ],
-            ignore_default_args=[
-                "--enable-automation",       # Removes "controlled by automation" banner
-                "--disable-setuid-sandbox",  # Removes unsupported flag warning on Windows
-            ],
+        )
+
+        # Create fresh context each time (no persistent profile = no stale session)
+        self._context = await self._browser.new_context(
             viewport={"width": 1920, "height": 1080},
             locale="pt-PT",
             timezone_id="Africa/Luanda",
@@ -55,17 +49,14 @@ class BrowserManager:
             ignore_https_errors=True,
         )
 
-        # Apply stealth scripts
+        # Apply stealth scripts BEFORE any page is created
         await self._apply_stealth()
 
-        # Load saved session if exists
+        # Load saved session cookies if exists
         await self._load_session()
 
-        # Use existing page or create new one
-        if self._context.pages:
-            self._page = self._context.pages[0]
-        else:
-            self._page = await self._context.new_page()
+        # Create new page
+        self._page = await self._context.new_page()
 
         # Set default timeout
         self._page.set_default_timeout(30000)
@@ -142,44 +133,12 @@ class BrowserManager:
             // Override chrome runtime
             window.chrome = {
                 runtime: {
-                    PlatformOs: {
-                        MAC: 'mac',
-                        WIN: 'win',
-                        ANDROID: 'android',
-                        CROS: 'cros',
-                        LINUX: 'linux',
-                        OPENBSD: 'openbsd',
-                    },
-                    PlatformArch: {
-                        ARM: 'arm',
-                        X86_32: 'x86-32',
-                        X86_64: 'x86-64',
-                        MIPS: 'mips',
-                        MIPS64: 'mips64',
-                    },
-                    PlatformNaclArch: {
-                        ARM: 'arm',
-                        X86_32: 'x86-32',
-                        X86_64: 'x86-64',
-                        MIPS: 'mips',
-                        MIPS64: 'mips64',
-                    },
-                    RequestUpdateCheckStatus: {
-                        THROTTLED: 'throttled',
-                        NO_UPDATE: 'no_update',
-                        UPDATE_AVAILABLE: 'update_available',
-                    },
-                    OnInstalledReason: {
-                        INSTALL: 'install',
-                        UPDATE: 'update',
-                        CHROME_UPDATE: 'chrome_update',
-                        SHARED_MODULE_UPDATE: 'shared_module_update',
-                    },
-                    OnRestartRequiredReason: {
-                        APP_UPDATE: 'app_update',
-                        OS_UPDATE: 'os_update',
-                        PERIODIC: 'periodic',
-                    },
+                    PlatformOs: { MAC: 'mac', WIN: 'win', ANDROID: 'android', CROS: 'cros', LINUX: 'linux', OPENBSD: 'openbsd' },
+                    PlatformArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64', MIPS: 'mips', MIPS64: 'mips64' },
+                    PlatformNaclArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64', MIPS: 'mips', MIPS64: 'mips64' },
+                    RequestUpdateCheckStatus: { THROTTLED: 'throttled', NO_UPDATE: 'no_update', UPDATE_AVAILABLE: 'update_available' },
+                    OnInstalledReason: { INSTALL: 'install', UPDATE: 'update', CHROME_UPDATE: 'chrome_update', SHARED_MODULE_UPDATE: 'shared_module_update' },
+                    OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
                 },
                 loadTimes: function() {
                     return {
@@ -199,11 +158,7 @@ class BrowserManager:
                     };
                 },
                 csi: function() {
-                    return {
-                        onloadT: Date.now(),
-                        startE: Date.now() - Math.random() * 1000,
-                        pageT: Math.random() * 3000,
-                    };
+                    return { onloadT: Date.now(), startE: Date.now() - Math.random() * 1000, pageT: Math.random() * 3000 };
                 },
             };
 
@@ -222,36 +177,6 @@ class BrowserManager:
                 if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650, OpenGL 4.5)';
                 return getParameter.call(this, param);
             };
-
-            // Override canvas fingerprint with subtle noise
-            const toBlob = HTMLCanvasElement.prototype.toBlob;
-            const toDataURL = HTMLCanvasElement.prototype.toDataURL;
-
-            HTMLCanvasElement.prototype.toBlob = function() {
-                const context = this.getContext('2d');
-                if (context) {
-                    const shift = {r: Math.floor(Math.random() * 3) - 1, g: Math.floor(Math.random() * 3) - 1, b: 0};
-                    const width = this.width, height = this.height;
-                    if (width && height) {
-                        const imageData = context.getImageData(0, 0, width, height);
-                        for (let i = 0; i < imageData.data.length; i += 4) {
-                            imageData.data[i] += shift.r;
-                            imageData.data[i+1] += shift.g;
-                        }
-                        context.putImageData(imageData, 0, 0);
-                    }
-                }
-                return toBlob.apply(this, arguments);
-            };
-
-            // Fix iframe contentWindow
-            try {
-                Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
-                    get: function() {
-                        return window;
-                    }
-                });
-            } catch(e) {}
         """)
 
     async def stop(self):
@@ -262,13 +187,16 @@ class BrowserManager:
         await self._save_session()
 
         if self._page:
+            await self._page.close()
             self._page = None
 
         if self._context:
             await self._context.close()
             self._context = None
 
-        self._browser = None
+        if self._browser:
+            await self._browser.close()
+            self._browser = None
 
         if self._playwright:
             await self._playwright.stop()
@@ -285,8 +213,8 @@ class BrowserManager:
             cookies = await self._context.cookies()
             session_data = {
                 "cookies": cookies,
-                "saved_at": datetime.utcnow().isoformat(),
-                "expires_at": (datetime.utcnow() + timedelta(hours=4)).isoformat(),
+                "saved_at": datetime.now().isoformat(),
+                "expires_at": (datetime.now() + timedelta(hours=4)).isoformat(),
             }
 
             self._session_file.parent.mkdir(parents=True, exist_ok=True)
@@ -309,7 +237,7 @@ class BrowserManager:
 
             # Check if session is expired
             expires_at = datetime.fromisoformat(session_data.get("expires_at", "2000-01-01"))
-            if datetime.utcnow() > expires_at:
+            if datetime.now() > expires_at:
                 logger.info("Saved session expired")
                 return
 
