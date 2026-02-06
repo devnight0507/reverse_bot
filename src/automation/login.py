@@ -48,30 +48,21 @@ class LoginAutomation:
         try:
             logger.info("Starting login process...")
 
-            # Clear stale session data to avoid "Session Expired" page
-            await self._handle_stale_session(page)
+            # Clear all stale data first
+            await self._clear_all_storage(page)
 
-            # Navigate to VFS homepage first, then to login (more natural)
-            logger.info(f"Navigating to {VFSUrls.BASE}")
-            await page.goto(VFSUrls.BASE, wait_until="domcontentloaded", timeout=30000)
-            await self.browser.random_delay(2000, 4000)
-
-            # Check for "Session Expired" or "page-not-found" page
-            if await self._is_session_expired_page(page):
-                logger.info("Session expired page detected, clearing cookies and retrying...")
-                await page.context.clear_cookies()
-                await page.goto(VFSUrls.BASE, wait_until="domcontentloaded", timeout=30000)
-                await self.browser.random_delay(2000, 4000)
-
-            # Navigate to login page
+            # Navigate directly to login page
             logger.info(f"Navigating to {VFSUrls.LOGIN}")
             await page.goto(VFSUrls.LOGIN, wait_until="domcontentloaded", timeout=30000)
-            await self.browser.random_delay(1000, 2000)
+            await self.browser.random_delay(2000, 4000)
 
-            # Check again for session expired after navigating to login
+            # If we hit "Session Expired" page, do a full clear and retry
             if await self._is_session_expired_page(page):
-                logger.info("Session expired on login page, clearing all data...")
-                await page.context.clear_cookies()
+                logger.info("Session expired page detected, doing full clear...")
+                await self._clear_all_storage(page)
+                # Navigate to homepage first, then login
+                await page.goto(VFSUrls.BASE, wait_until="domcontentloaded", timeout=30000)
+                await self.browser.random_delay(2000, 3000)
                 await page.goto(VFSUrls.LOGIN, wait_until="domcontentloaded", timeout=30000)
                 await self.browser.random_delay(2000, 4000)
 
@@ -331,17 +322,29 @@ class LoginAutomation:
         except:
             return False
 
-    async def _handle_stale_session(self, page: Page):
-        """Clear stale session data that causes 'Session Expired' errors"""
+    async def _clear_all_storage(self, page: Page):
+        """Clear cookies, localStorage, and sessionStorage to avoid stale session issues"""
         try:
+            # Clear cookies
+            await page.context.clear_cookies()
+
+            # Clear localStorage and sessionStorage via JS
+            await page.evaluate("""
+                () => {
+                    try { localStorage.clear(); } catch(e) {}
+                    try { sessionStorage.clear(); } catch(e) {}
+                }
+            """)
+
             # Delete old session file
             session_file = self.browser._session_file
             if session_file.exists():
                 import os
                 os.remove(session_file)
-                logger.info("Cleared stale session file")
+
+            logger.info("Cleared all browser storage")
         except Exception as e:
-            logger.debug(f"Session cleanup: {e}")
+            logger.debug(f"Storage cleanup: {e}")
 
     async def logout(self) -> bool:
         """Logout from VFS Global"""

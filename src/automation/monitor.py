@@ -87,16 +87,15 @@ class SlotMonitor:
         logger.info(f"Monitoring for {len(applicants)} applicants")
 
         try:
-            # Ensure logged in
-            logged_in = await self.login.check_session()
-            if not logged_in:
-                success, message = await self.login.login()
-                if not success:
-                    logger.error(f"Login failed: {message}")
-                    if self.on_error:
-                        await self._call_callback(self.on_error, "login_failed", message)
-                    self._running = False
-                    return
+            # Login first (don't check dashboard before login - causes Session Expired)
+            logger.info("Logging in...")
+            success, message = await self.login.login()
+            if not success:
+                logger.error(f"Login failed: {message}")
+                if self.on_error:
+                    await self._call_callback(self.on_error, "login_failed", message)
+                self._running = False
+                return
 
             # Start monitoring loop
             while self._running:

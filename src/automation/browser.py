@@ -39,9 +39,6 @@ class BrowserManager:
             channel="chrome",  # Use real installed Chrome, not Playwright's Chromium
             args=[
                 "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
                 "--disable-infobars",
                 "--window-size=1920,1080",
             ],
