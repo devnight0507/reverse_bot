@@ -23,6 +23,7 @@ data/screenshots/
 data/logs/
 data/session.json
 data/browser_profile
+data/video_screenshot
 
 # OS
 .DS_Store

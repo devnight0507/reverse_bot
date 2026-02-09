@@ -1,5 +1,17 @@
 """
 Login Automation - Handles VFS Global login process including OTP
+
+Flow (based on real user behavior):
+1. Navigate to /book-an-appointment
+2. Handle cookie consent ("Accept All Cookies")
+3. Click "Book now" → opens /login in NEW TAB
+4. Switch to new tab, wait for Angular to render login form
+5. Enter email + password
+6. Turnstile appears AFTER entering credentials → solve it
+7. Click "Sign In"
+8. OTP page appears → read OTP from email via IMAP
+9. Enter OTP, Turnstile appears again → solve it
+10. Click "Sign In" → navigates to /dashboard
 """
 import asyncio
 import re
@@ -48,22 +60,20 @@ class LoginAutomation:
         try:
             logger.info("Starting login process...")
 
-            # Step 1: Navigate to "Book an appointment" page (with retry for Cloudflare 403)
+            # ============================================================
+            # Step 1: Navigate to /book-an-appointment (with retry)
+            # ============================================================
             max_retries = 3
             page_loaded = False
 
             for attempt in range(1, max_retries + 1):
                 logger.info(f"Navigating to {VFSUrls.BOOK_APPOINTMENT} (attempt {attempt}/{max_retries})")
                 await page.goto(VFSUrls.BOOK_APPOINTMENT, wait_until="domcontentloaded", timeout=30000)
-
-                # Wait for Angular SPA to fully render
                 await self.browser.random_delay(5000, 8000)
 
-                # Check if Cloudflare blocked us (403201 JSON response)
                 if await self._is_blocked_page(page):
                     logger.warning(f"Cloudflare 403 detected (attempt {attempt}/{max_retries})")
                     if attempt < max_retries:
-                        # Wait longer before retry (exponential backoff)
                         wait_time = 10 * attempt
                         logger.info(f"Waiting {wait_time}s before retry...")
                         await asyncio.sleep(wait_time)
@@ -73,15 +83,11 @@ class LoginAutomation:
                         await self.browser.screenshot("cloudflare_blocked")
                         return False, "Blocked by Cloudflare protection. Try again later."
 
-                # If session expired page, clear storage and reload
                 if await self._is_session_expired_page(page):
                     logger.info("Session expired page detected, clearing storage...")
                     await self._clear_all_storage(page)
                     await page.goto(VFSUrls.BOOK_APPOINTMENT, wait_until="domcontentloaded", timeout=30000)
                     await self.browser.random_delay(5000, 8000)
-
-                # Handle cookie consent
-                await self._handle_cookie_consent(page)
 
                 page_loaded = True
                 break
@@ -89,8 +95,14 @@ class LoginAutomation:
             if not page_loaded:
                 return False, "Failed to load VFS page after retries"
 
-            # Step 2: Click "Book now" button to trigger Angular router navigation to /login
-            # Use wait_for_selector instead of query_selector to give Angular time to render
+            # ============================================================
+            # Step 2: Handle cookie consent
+            # ============================================================
+            await self._handle_cookie_consent(page)
+
+            # ============================================================
+            # Step 3: Click "Book now" → opens /login in a NEW TAB
+            # ============================================================
             logger.info("Waiting for 'Book now' button...")
             book_now_selectors = [
                 "a.lets-get-started",
@@ -109,77 +121,69 @@ class LoginAutomation:
                 except:
                     continue
 
-            if book_now_btn:
-                # Remove any lingering cookie overlays before clicking
-                await self._remove_cookie_overlays(page)
-                await self.browser.random_delay(500, 1000)
+            if not book_now_btn:
+                await self.browser.screenshot("book_now_not_found")
+                return False, "Book now button not found"
 
-                # IMPORTANT: Do NOT use force=True - it bypasses Angular's event handlers
-                # Angular needs to handle the click to do client-side routing (no new HTTP request)
-                # A direct HTTP request to /login gets blocked by Cloudflare (403201)
-                try:
+            # Remove cookie overlays that might block the click
+            await self._remove_cookie_overlays(page)
+            await self.browser.random_delay(500, 1000)
+
+            # Log the link attributes
+            href = await book_now_btn.get_attribute("href")
+            target = await book_now_btn.get_attribute("target")
+            logger.info(f"Book now link - href: {href}, target: {target}")
+
+            # Click "Book now" - it opens /login in a new tab (this is normal VFS behavior)
+            # Use expect_page() to catch the new tab
+            login_page = None
+            try:
+                async with page.context.expect_page(timeout=15000) as new_page_info:
                     await book_now_btn.click(timeout=10000)
-                    logger.info("Clicked 'Book now' button (normal click)")
-                except Exception as click_err:
-                    logger.warning(f"Normal click failed ({click_err}), trying JS click...")
-                    # JS click preserves Angular event handling
-                    await page.evaluate("document.querySelector('a.lets-get-started')?.click()")
+                login_page = await new_page_info.value
+                logger.info(f"New tab opened: {login_page.url}")
+            except Exception as e:
+                logger.warning(f"No new tab opened ({e}), checking current page...")
 
-                # Wait for Angular router to navigate to /login
-                logger.info("Waiting for Angular router to navigate to /login...")
-                try:
-                    await page.wait_for_url("**/login**", timeout=10000)
-                    logger.info(f"Navigated to login page: {page.url}")
-                except:
-                    logger.warning(f"URL didn't change to /login. Current URL: {page.url}")
-                    # If URL didn't change, try JS-based Angular navigation
-                    if "/login" not in page.url:
-                        logger.info("Trying JavaScript navigation within Angular...")
-                        await page.evaluate("""
-                            () => {
-                                // Try Angular router navigation
-                                const router = window.ng?.getComponent(document.querySelector('app-root'))?.router;
-                                if (router) {
-                                    router.navigate(['/login']);
-                                    return;
-                                }
-                                // Fallback: simulate link click via JS
-                                const link = document.querySelector('a.lets-get-started') ||
-                                             document.querySelector('a[href*="login"]');
-                                if (link) {
-                                    link.click();
-                                    return;
-                                }
-                                // Last resort: use Angular's Location service via URL change
-                                window.history.pushState({}, '', '/ago/en/prt/login');
-                                window.dispatchEvent(new PopStateEvent('popstate'));
-                            }
-                        """)
-                        await self.browser.random_delay(3000, 5000)
+                # If no new tab, check if navigation happened in the same tab
+                if "/login" in page.url:
+                    login_page = page
+                    logger.info("Navigated to login in same tab")
 
-                    # If still not on login page, try direct navigation as last resort
-                    if "/login" not in page.url:
-                        logger.warning("Angular navigation failed, trying direct URL (may get 403)...")
-                        await page.goto(VFSUrls.LOGIN, wait_until="domcontentloaded", timeout=30000)
-                        await self.browser.random_delay(3000, 5000)
+            # If new tab opened, switch to it
+            if login_page and login_page != page:
+                logger.info("Switching to login tab...")
+                self.browser._page = login_page
+                page = login_page
 
-                        if await self._is_blocked_page(page):
-                            logger.error("Direct login URL blocked by Cloudflare")
-                            await self.browser.screenshot("login_blocked")
-                            return False, "Blocked by Cloudflare. Try again later."
-            else:
-                logger.warning("Book now button not found, trying direct login URL...")
+            # If still no login page, try fallback approaches
+            if not login_page or ("/login" not in page.url and "/login" not in (login_page.url if login_page else "")):
+                logger.warning("Book now click didn't open login page")
+
+                # Fallback: try direct navigation
+                logger.info("Trying direct navigation to /login...")
                 await page.goto(VFSUrls.LOGIN, wait_until="domcontentloaded", timeout=30000)
-                await self.browser.random_delay(5000, 8000)
+                await self.browser.random_delay(3000, 5000)
 
                 if await self._is_blocked_page(page):
-                    logger.error("Direct login URL also blocked by Cloudflare")
                     await self.browser.screenshot("login_blocked")
-                    return False, "Blocked by Cloudflare protection. Try again later."
+                    return False, "Login page blocked by Cloudflare"
 
-            await self.browser.random_delay(2000, 3000)
-            logger.info(f"Current URL: {page.url}")
+            # ============================================================
+            # Step 4: Wait for Angular to render the login form
+            # Angular takes time to bootstrap in the new tab
+            # (Screenshots show: loading spinner → template placeholders → full form)
+            # ============================================================
+            logger.info("Waiting for login form to render...")
+            await self.browser.random_delay(3000, 5000)
+
+            # Check if page got blocked
+            if await self._is_blocked_page(page):
+                await self.browser.screenshot("login_page_blocked")
+                return False, "Login page blocked by Cloudflare (403201)"
+
             await self.browser.screenshot("login_page_loaded")
+            logger.info(f"Current URL: {page.url}")
 
             # Check if already logged in
             if await self._is_logged_in(page):
@@ -187,72 +191,117 @@ class LoginAutomation:
                 return True, "Already logged in"
 
             # Wait for login form with multiple possible selectors
-            logger.info("Waiting for login form...")
             login_selectors = [
+                "input[placeholder*='jane.doe']",  # Seen in screenshots
+                "input[placeholder*='mail']",
                 Selectors.EMAIL_INPUT,
                 "input[type='email']",
                 "input[formcontrolname='username']",
                 "input[formcontrolname='email']",
-                "input[placeholder*='mail']",
-                "input[placeholder*='Mail']",
             ]
 
-            login_form_found = False
+            email_input = None
             for selector in login_selectors:
                 try:
-                    await page.wait_for_selector(selector, timeout=5000)
-                    logger.info(f"Login form found with selector: {selector}")
-                    # Update the selector for this session
-                    Selectors.EMAIL_INPUT = selector
-                    login_form_found = True
-                    break
+                    email_input = await page.wait_for_selector(selector, timeout=10000)
+                    if email_input:
+                        logger.info(f"Login form found with selector: {selector}")
+                        break
                 except:
                     continue
 
-            if not login_form_found:
-                # Take screenshot of what's actually showing
+            if not email_input:
                 await self.browser.screenshot("login_form_not_found")
-                logger.error(f"Login form not found. Current URL: {page.url}")
-                # Log page content for debugging
                 title = await page.title()
-                logger.error(f"Page title: {title}")
+                logger.error(f"Login form not found. URL: {page.url}, Title: {title}")
                 return False, f"Login form not found. URL: {page.url}"
 
-            # Enter email
+            # ============================================================
+            # Step 5: Enter email + password
+            # ============================================================
             logger.info("Entering email...")
-            await self.browser.human_type(Selectors.EMAIL_INPUT, email)
+            await email_input.click()
+            await self.browser.random_delay(300, 600)
+            await page.keyboard.type(email, delay=50)
             await self.browser.random_delay(500, 1000)
 
-            # Enter password
+            # Find and fill password
             logger.info("Entering password...")
-            await self.browser.human_type(Selectors.PASSWORD_INPUT, password)
-            await self.browser.random_delay(500, 1000)
+            password_input = await page.query_selector(
+                f"{Selectors.PASSWORD_INPUT}, input[type='password']"
+            )
+            if password_input:
+                await password_input.click()
+                await self.browser.random_delay(300, 600)
+                await page.keyboard.type(password, delay=50)
+                await self.browser.random_delay(500, 1000)
+            else:
+                return False, "Password field not found"
 
-            # Handle Turnstile if present
-            if await self._has_turnstile(page):
-                logger.info("Turnstile detected, solving...")
-                token = await self.turnstile.solve(page)
-                if not token:
-                    await self.browser.screenshot("turnstile_failed")
-                    return False, "Failed to solve Turnstile captcha"
-                await self.browser.random_delay(1000, 2000)
+            await self.browser.screenshot("credentials_entered")
 
-            # Click sign in button
-            logger.info("Clicking sign in button...")
-            await self.browser.human_click(Selectors.SIGN_IN_BUTTON)
-            await self.browser.random_delay(2000, 4000)
+            # ============================================================
+            # Step 6: Turnstile appears AFTER entering credentials
+            # Wait for it to appear and solve it
+            # ============================================================
+            logger.info("Waiting for Turnstile to appear...")
+            await self.browser.random_delay(2000, 3000)
 
-            # Check if OTP page appeared
+            # Wait for Turnstile widget to appear (it shows after filling credentials)
+            turnstile_solved = await self._wait_and_solve_turnstile(page)
+            if turnstile_solved:
+                logger.info("Turnstile solved on login page")
+            else:
+                logger.info("No Turnstile detected or already passed")
+
+            await self.browser.screenshot("before_sign_in")
+
+            # ============================================================
+            # Step 7: Click "Sign In" button
+            # ============================================================
+            logger.info("Clicking Sign In button...")
+            sign_in_selectors = [
+                Selectors.SIGN_IN_BUTTON,
+                "button:has-text('Sign In')",
+                "button:has-text('Sign in')",
+                "button[type='submit']",
+            ]
+
+            sign_in_clicked = False
+            for selector in sign_in_selectors:
+                try:
+                    btn = await page.wait_for_selector(selector, timeout=5000)
+                    if btn:
+                        # Wait for button to be enabled (enabled after Turnstile passes)
+                        await self.browser.random_delay(1000, 2000)
+                        await btn.click()
+                        logger.info(f"Sign In clicked with: {selector}")
+                        sign_in_clicked = True
+                        break
+                except:
+                    continue
+
+            if not sign_in_clicked:
+                await self.browser.screenshot("sign_in_button_not_found")
+                return False, "Sign In button not found or not clickable"
+
+            await self.browser.random_delay(3000, 5000)
+            await self.browser.screenshot("after_sign_in")
+
+            # ============================================================
+            # Step 8: Check for OTP page
+            # ============================================================
             if await self._is_otp_page(page):
                 logger.info("OTP page detected - 2FA required")
                 success, message = await self._handle_otp(page)
                 if not success:
                     return False, message
 
-            # Wait for navigation result
+            # ============================================================
+            # Step 9: Wait for dashboard
+            # ============================================================
             await self._wait_for_login_result(page)
 
-            # Check if login was successful
             if await self._is_logged_in(page):
                 logger.info("Login successful!")
                 await self.browser.screenshot("login_success")
@@ -268,17 +317,72 @@ class LoginAutomation:
             await self.browser.screenshot("login_error")
             return False, f"Login error: {str(e)}"
 
+    async def _wait_and_solve_turnstile(self, page: Page, timeout: int = 30) -> bool:
+        """
+        Wait for Turnstile to appear and solve it.
+        Turnstile appears AFTER entering credentials on VFS login page.
+        Returns True if Turnstile was found and solved.
+        """
+        try:
+            # Wait for Turnstile widget to appear
+            turnstile_selectors = [
+                "iframe[src*='challenges.cloudflare.com']",
+                ".cf-turnstile",
+                "[data-sitekey]",
+            ]
+
+            turnstile_found = False
+            for selector in turnstile_selectors:
+                try:
+                    await page.wait_for_selector(selector, timeout=timeout * 1000)
+                    turnstile_found = True
+                    logger.info(f"Turnstile widget found: {selector}")
+                    break
+                except:
+                    continue
+
+            if not turnstile_found:
+                return False
+
+            # Check if Turnstile auto-solved (shows "Success!" for real users)
+            await self.browser.random_delay(3000, 5000)
+
+            # Check for success state
+            success = await page.evaluate("""
+                () => {
+                    const body = document.body.innerText;
+                    return body.includes('Success') || body.includes('success');
+                }
+            """)
+
+            if success:
+                logger.info("Turnstile auto-solved (Success!)")
+                return True
+
+            # If not auto-solved, use 2Captcha API
+            logger.info("Turnstile not auto-solved, using 2Captcha...")
+            token = await self.turnstile.solve(page)
+            if token:
+                logger.info("Turnstile solved via 2Captcha")
+                return True
+            else:
+                logger.warning("Failed to solve Turnstile via 2Captcha")
+                return False
+
+        except Exception as e:
+            logger.error(f"Turnstile handling error: {e}")
+            return False
+
     async def _is_otp_page(self, page: Page) -> bool:
         """Check if the OTP/2FA page is showing"""
         try:
-            # Check for OTP-related text
             content = await page.content()
             otp_indicators = [
                 "one time password",
                 "otp",
                 "verification code",
                 "enter your code",
-                "enviado por e-mail",  # Portuguese: sent by email
+                "enviado por e-mail",
             ]
 
             content_lower = content.lower()
@@ -286,7 +390,6 @@ class LoginAutomation:
                 if indicator in content_lower:
                     return True
 
-            # Check for OTP input field
             otp_input = await page.query_selector(Selectors.OTP_INPUT)
             if otp_input and await otp_input.is_visible():
                 return True
@@ -296,11 +399,14 @@ class LoginAutomation:
             return False
 
     async def _handle_otp(self, page: Page) -> Tuple[bool, str]:
-        """Handle OTP/2FA step"""
+        """Handle OTP/2FA step (with Turnstile on OTP page)"""
         logger.info("Handling OTP verification...")
         await self.browser.screenshot("otp_page")
 
         # Method 1: Try to read OTP from email automatically
+        # Wait a few seconds for the email to arrive
+        logger.info("Waiting 10s for OTP email to arrive...")
+        await asyncio.sleep(10)
         otp_code = await self._read_otp_from_email()
 
         # Method 2: Use callback if configured (e.g., Telegram prompt)
@@ -311,7 +417,16 @@ class LoginAutomation:
             except Exception as e:
                 logger.error(f"OTP callback error: {e}")
 
-        # Method 3: Wait for user to enter OTP manually in the browser
+        # Method 3: If no OTP from email, retry a few times
+        if not otp_code:
+            for retry in range(1, 6):  # Retry 5 times, 10s apart
+                logger.info(f"OTP email not found, retrying ({retry}/5)...")
+                await asyncio.sleep(10)
+                otp_code = await self._read_otp_from_email()
+                if otp_code:
+                    break
+
+        # Method 4: Wait for user to enter OTP manually
         if not otp_code:
             logger.info("Waiting for manual OTP entry (120s timeout)...")
             logger.info("Please enter the OTP code in the browser window")
@@ -321,27 +436,50 @@ class LoginAutomation:
             return False, "OTP timeout - no code entered within 120 seconds"
 
         # Enter the OTP code
-        logger.info(f"Entering OTP code...")
+        logger.info("Entering OTP code...")
         try:
-            # Find and fill OTP input
-            otp_input = await page.wait_for_selector(Selectors.OTP_INPUT, timeout=5000)
+            # Find OTP input field
+            otp_input = await page.wait_for_selector(
+                f"{Selectors.OTP_INPUT}, input[type='password'], input[type='text']",
+                timeout=10000
+            )
             if otp_input:
                 await otp_input.click()
                 await self.browser.random_delay(200, 500)
+                # Clear any existing value first
+                await page.keyboard.press("Control+A")
                 await page.keyboard.type(otp_code, delay=80)
                 await self.browser.random_delay(500, 1000)
 
-                # Handle Turnstile on OTP page if present
-                if await self._has_turnstile(page):
-                    logger.info("Turnstile on OTP page, solving...")
-                    await self.turnstile.solve(page)
-                    await self.browser.random_delay(1000, 2000)
+                await self.browser.screenshot("otp_entered")
 
-                # Click submit
-                submit_btn = await page.query_selector(Selectors.OTP_SUBMIT)
-                if submit_btn:
-                    await submit_btn.click()
-                    await self.browser.random_delay(2000, 4000)
+                # Turnstile appears on OTP page too - wait and solve it
+                logger.info("Checking for Turnstile on OTP page...")
+                await self._wait_and_solve_turnstile(page, timeout=15)
+
+                # Wait for Sign In button to be enabled
+                await self.browser.random_delay(1000, 2000)
+
+                # Click Sign In on OTP page
+                sign_in_selectors = [
+                    Selectors.OTP_SUBMIT,
+                    "button:has-text('Sign In')",
+                    "button:has-text('Sign in')",
+                    "button[type='submit']",
+                ]
+
+                for selector in sign_in_selectors:
+                    try:
+                        btn = await page.query_selector(selector)
+                        if btn:
+                            await btn.click()
+                            logger.info(f"OTP Sign In clicked with: {selector}")
+                            break
+                    except:
+                        continue
+
+                await self.browser.random_delay(3000, 5000)
+                await self.browser.screenshot("after_otp_submit")
 
                 return True, "OTP submitted"
             else:
@@ -363,7 +501,6 @@ class LoginAutomation:
 
             logger.info("Checking email for OTP code...")
 
-            # Connect to Gmail IMAP
             imap = imaplib.IMAP4_SSL("imap.gmail.com")
             imap.login(settings.smtp_user, settings.smtp_password)
             imap.select("INBOX")
@@ -421,13 +558,10 @@ class LoginAutomation:
     async def _wait_for_manual_otp(self, page: Page, timeout: int = 120) -> bool:
         """Wait for user to manually enter OTP in the browser"""
         try:
-            # Wait for the page to navigate away from OTP (user enters code manually)
             await page.wait_for_function(
                 """
                 () => {
-                    // Check if we moved past OTP page
                     if (window.location.href.includes('/dashboard')) return true;
-                    // Check for error message
                     const body = document.body.innerText.toLowerCase();
                     if (!body.includes('one time password') && !body.includes('otp')) return true;
                     return false;
@@ -443,17 +577,14 @@ class LoginAutomation:
         """Check if Cloudflare/VFS WAF blocked the request (403201 JSON response)"""
         try:
             content = await page.content()
-            content_lower = content.lower()
 
-            # Check for 403201 JSON response
             if '"403201"' in content or '"code":"403201"' in content.replace(" ", ""):
                 return True
 
-            # Check for Cloudflare block page indicators
+            content_lower = content.lower()
             if "access denied" in content_lower and "cloudflare" in content_lower:
                 return True
 
-            # Check for empty/minimal page (Cloudflare may return very little HTML)
             body_text = await page.evaluate("() => document.body?.innerText?.trim() || ''")
             if body_text and body_text.startswith('{"code"'):
                 return True
@@ -463,7 +594,7 @@ class LoginAutomation:
             return False
 
     async def _is_session_expired_page(self, page: Page) -> bool:
-        """Check if current page is the 'Session Expired' or 'page-not-found' page"""
+        """Check if current page is the 'Session Expired' page"""
         try:
             url = page.url.lower()
             if "page-not-found" in url:
@@ -471,13 +602,7 @@ class LoginAutomation:
 
             content = await page.content()
             content_lower = content.lower()
-            expired_indicators = [
-                "session expired",
-                "session invalid",
-                "sessão expirada",
-                "go back to home",
-            ]
-            for indicator in expired_indicators:
+            for indicator in ["session expired", "session invalid", "sessão expirada", "go back to home"]:
                 if indicator in content_lower:
                     return True
 
@@ -486,12 +611,9 @@ class LoginAutomation:
             return False
 
     async def _clear_all_storage(self, page: Page):
-        """Clear cookies, localStorage, and sessionStorage to avoid stale session issues"""
+        """Clear cookies, localStorage, and sessionStorage"""
         try:
-            # Clear cookies
             await page.context.clear_cookies()
-
-            # Clear localStorage and sessionStorage via JS
             await page.evaluate("""
                 () => {
                     try { localStorage.clear(); } catch(e) {}
@@ -499,7 +621,6 @@ class LoginAutomation:
                 }
             """)
 
-            # Delete old session file
             session_file = self.browser._session_file
             if session_file.exists():
                 import os
@@ -516,11 +637,12 @@ class LoginAutomation:
             return False
 
         try:
+            # From Screenshot 19: "Sign Out" is in the top right
             logout_selectors = [
-                "button:has-text('Logout')",
+                "a:has-text('Sign Out')",
                 "button:has-text('Sign Out')",
                 "a:has-text('Logout')",
-                ".logout-btn",
+                "button:has-text('Logout')",
             ]
 
             for selector in logout_selectors:
@@ -543,9 +665,9 @@ class LoginAutomation:
             return False
 
     async def _handle_cookie_consent(self, page: Page):
-        """Handle cookie consent popup/overlay if present"""
+        """Handle cookie consent popup - click 'Accept All Cookies'"""
         try:
-            # Wait for any OneTrust element (banner OR overlay)
+            # Wait for cookie banner (from Screenshot 4: banner appears at bottom)
             try:
                 await page.wait_for_selector(
                     "#onetrust-banner-sdk, #onetrust-consent-sdk, .onetrust-pc-dark-filter",
@@ -556,14 +678,13 @@ class LoginAutomation:
                 logger.debug("No cookie consent elements found")
                 return
 
-            # Try clicking accept/reject buttons
+            # From Screenshot 5: "Accept All Cookies" button
             button_selectors = [
                 "#onetrust-accept-btn-handler",
-                "#onetrust-reject-all-handler",
-                "#accept-recommended-btn-handler",
-                "button:has-text('Aceitar todos')",
+                "button:has-text('Accept All Cookies')",
+                "button:has-text('Aceitar todos os cookies')",
                 "button:has-text('Accept All')",
-                "button:has-text('Rejeitar Todos')",
+                "#accept-recommended-btn-handler",
             ]
 
             button_clicked = False
@@ -579,7 +700,7 @@ class LoginAutomation:
                 except:
                     continue
 
-            # Always remove blocking overlays via JS (even if button was clicked)
+            # Always remove blocking overlays via JS
             await self._remove_cookie_overlays(page)
 
             if not button_clicked:
@@ -593,12 +714,9 @@ class LoginAutomation:
         try:
             await page.evaluate("""
                 () => {
-                    // Remove dark overlay filter
                     document.querySelectorAll('.onetrust-pc-dark-filter').forEach(el => el.remove());
-                    // Hide the entire consent SDK if banner was dismissed
                     const sdk = document.getElementById('onetrust-consent-sdk');
                     if (sdk) sdk.style.display = 'none';
-                    // Remove any other blocking overlays
                     document.querySelectorAll('[class*="onetrust"][class*="filter"]').forEach(el => el.remove());
                 }
             """)
@@ -606,26 +724,8 @@ class LoginAutomation:
         except Exception as e:
             logger.debug(f"Overlay removal: {e}")
 
-    async def _has_turnstile(self, page: Page) -> bool:
-        """Check if Turnstile captcha is present"""
-        try:
-            selectors = [
-                Selectors.TURNSTILE_IFRAME,
-                ".cf-turnstile",
-                "[data-sitekey]",
-            ]
-
-            for selector in selectors:
-                element = await page.query_selector(selector)
-                if element:
-                    return True
-
-            return False
-        except:
-            return False
-
     async def _is_logged_in(self, page: Page) -> bool:
-        """Check if user is logged in"""
+        """Check if user is logged in (from Screenshot 19: /dashboard with 'Start New Booking')"""
         try:
             if "/dashboard" in page.url:
                 return True
@@ -633,8 +733,9 @@ class LoginAutomation:
             dashboard_selectors = [
                 Selectors.NEW_BOOKING_BUTTON,
                 "text=Start New Booking",
-                "text=My Appointments",
-                ".dashboard",
+                "text=Active application",
+                "text=No Application(s) Found",
+                "a:has-text('Sign Out')",
             ]
 
             for selector in dashboard_selectors:
@@ -646,12 +747,11 @@ class LoginAutomation:
                     continue
 
             return False
-
         except:
             return False
 
     async def _wait_for_login_result(self, page: Page, timeout: int = 30000):
-        """Wait for login result (success or error)"""
+        """Wait for login result (dashboard or error)"""
         try:
             await page.wait_for_function(
                 """
@@ -659,6 +759,8 @@ class LoginAutomation:
                     if (window.location.href.includes('/dashboard')) return true;
                     if (document.querySelector('.alert-danger')) return true;
                     if (document.querySelector('.error-message')) return true;
+                    // Also check for OTP page (login step 2)
+                    if (document.body.innerText.toLowerCase().includes('one time password')) return true;
                     return false;
                 }
                 """,
@@ -690,7 +792,6 @@ class LoginAutomation:
                     continue
 
             return "Unknown error"
-
         except:
             return "Unknown error"
 
