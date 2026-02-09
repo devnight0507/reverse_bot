@@ -141,16 +141,18 @@ class LoginAutomation:
             target = await book_now_btn.get_attribute("target")
             logger.info(f"Book now link - href: {href}, target: {target}")
 
-            # --- Strategy 1: Remove target="_blank" and click in same tab ---
-            # This makes a real HTTP navigation with proper headers:
-            #   Sec-Fetch-Site: same-origin (not "none" like new tab)
+            # --- Strategy 1: Remove target="_blank" + override window.open, click same tab ---
+            # Clicking in same tab sends proper HTTP headers that pass Cloudflare:
+            #   Sec-Fetch-Site: same-origin (not "none" like new tab/address bar)
             #   Referer: .../book-an-appointment
             #   Cookie: cf_clearance=... (from initial page load)
+            # Also override window.open in case Angular's JS handler opens new tab
             login_reached = False
             try:
-                logger.info("Removing target=_blank from Book Now link...")
+                logger.info("Strategy 1: Same-tab click (remove target + override window.open)...")
                 await page.evaluate("""
                     () => {
+                        // Remove target="_blank" from login links
                         const links = document.querySelectorAll('a[target="_blank"]');
                         for (const link of links) {
                             if (link.href && (link.href.includes('/login') ||
@@ -158,6 +160,11 @@ class LoginAutomation:
                                 link.removeAttribute('target');
                             }
                         }
+                        // Override window.open to prevent new tab if JS handler opens one
+                        window.open = function(url) {
+                            window.location.href = url;
+                            return window;
+                        };
                     }
                 """)
                 await self.browser.random_delay(300, 600)
@@ -165,7 +172,7 @@ class LoginAutomation:
                 # Click the modified link - navigates in same tab
                 await book_now_btn.click(timeout=10000)
 
-                # Wait for full page load (this is a real HTTP navigation)
+                # Wait for navigation (full HTTP page load)
                 try:
                     await page.wait_for_load_state("domcontentloaded", timeout=30000)
                 except:
@@ -174,18 +181,47 @@ class LoginAutomation:
 
                 if "/login" in page.url and not await self._is_blocked_page(page):
                     login_reached = True
-                    logger.info(f"Same-tab navigation to /login successful. URL: {page.url}")
+                    logger.info(f"Strategy 1 succeeded. URL: {page.url}")
                 elif await self._is_blocked_page(page):
-                    logger.warning("Same-tab click got blocked by Cloudflare")
-                    await self.browser.screenshot("same_tab_blocked")
+                    logger.warning("Strategy 1: Blocked by Cloudflare")
+                    await self.browser.screenshot("strategy1_blocked")
                 else:
-                    logger.warning(f"After click, unexpected URL: {page.url}")
+                    logger.warning(f"Strategy 1: Unexpected URL: {page.url}")
             except Exception as e:
-                logger.warning(f"Same-tab click failed: {e}")
+                logger.warning(f"Strategy 1 failed: {e}")
 
-            # --- Strategy 2: Direct page.goto (last resort) ---
+            # --- Strategy 2: location.href from page context (same-origin headers) ---
+            # page.evaluate('location.href=...') sends Sec-Fetch-Site:same-origin
+            # unlike page.goto() which sends Sec-Fetch-Site:none (like address bar)
             if not login_reached:
-                logger.warning("Same-tab click failed, trying direct navigation...")
+                try:
+                    logger.info("Strategy 2: location.href navigation (same-origin)...")
+                    # Return to appointment page for clean state/Referer if needed
+                    if "/book-an-appointment" not in page.url:
+                        await page.goto(VFSUrls.BOOK_APPOINTMENT, wait_until="domcontentloaded", timeout=30000)
+                        await self.browser.random_delay(3000, 5000)
+                    # Navigate via JS - browser sends same-origin headers
+                    login_url = VFSUrls.LOGIN
+                    await page.evaluate(f"() => {{ window.location.href = '{login_url}'; }}")
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+                    except:
+                        pass
+                    await self.browser.random_delay(3000, 5000)
+
+                    if "/login" in page.url and not await self._is_blocked_page(page):
+                        login_reached = True
+                        logger.info(f"Strategy 2 succeeded. URL: {page.url}")
+                    elif await self._is_blocked_page(page):
+                        logger.warning("Strategy 2: Blocked by Cloudflare")
+                        await self.browser.screenshot("strategy2_blocked")
+                except Exception as e:
+                    logger.warning(f"Strategy 2 failed: {e}")
+
+            # --- Strategy 3: Direct page.goto (last resort) ---
+            # Sends Sec-Fetch-Site:none - most likely to be blocked but worth trying
+            if not login_reached:
+                logger.warning("Strategy 3: Direct page.goto (last resort)...")
                 await page.goto(VFSUrls.LOGIN, wait_until="domcontentloaded", timeout=30000)
                 await self.browser.random_delay(3000, 5000)
 
