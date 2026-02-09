@@ -64,6 +64,24 @@ class LoginAutomation:
             logger.info("Starting login process...")
 
             # ============================================================
+            # Step 0: Clear stale session data before login
+            # Critical for CDP mode which uses a persistent Chrome profile.
+            # Stale session tokens cause VFS to redirect to "Session Expired"
+            # or "page-not-found" with rate-limiting messages.
+            # ============================================================
+            logger.info("Clearing stale session data...")
+            try:
+                await page.context.clear_cookies()
+                await page.evaluate("""
+                    () => {
+                        try { localStorage.clear(); } catch(e) {}
+                        try { sessionStorage.clear(); } catch(e) {}
+                    }
+                """)
+            except Exception:
+                pass  # Page might be on about:blank, that's OK
+
+            # ============================================================
             # Step 1: Navigate to /book-an-appointment (with retry)
             # ============================================================
             max_retries = 3
@@ -662,7 +680,15 @@ class LoginAutomation:
 
             content = await page.content()
             content_lower = content.lower()
-            for indicator in ["session expired", "session invalid", "sessão expirada", "go back to home"]:
+            for indicator in [
+                "session expired",
+                "session invalid",
+                "sessão expirada",
+                "go back to home",
+                "unable to progress with your request",
+                "try again in one hour",
+                "cleared your cache memory",
+            ]:
                 if indicator in content_lower:
                     return True
 
