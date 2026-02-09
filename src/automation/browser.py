@@ -84,7 +84,15 @@ class BrowserManager:
         # Find a free port for remote debugging
         cdp_port = self._find_free_port()
 
-        # Ensure profile directory exists
+        # Delete old profile to ensure completely clean state
+        # This removes stale cookies, IndexedDB, cache, service workers -
+        # all of which can cause VFS "Session Expired" redirects
+        if self._chrome_profile_dir.exists():
+            try:
+                shutil.rmtree(self._chrome_profile_dir)
+                logger.info("Cleaned Chrome profile for fresh start")
+            except Exception as e:
+                logger.warning(f"Could not clean Chrome profile: {e}")
         self._chrome_profile_dir.mkdir(parents=True, exist_ok=True)
 
         # Launch Chrome as a NORMAL process - no automation flags whatsoever
