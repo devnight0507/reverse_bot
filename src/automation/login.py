@@ -1,11 +1,14 @@
 """
 Login Automation - Handles VFS Global login process including OTP
 
-Flow (based on real user behavior):
-1. Navigate to /book-an-appointment
+Flow (SPA-based to avoid Cloudflare 403201 on /login):
+1. Navigate to /book-an-appointment (Cloudflare allows this)
 2. Handle cookie consent ("Accept All Cookies")
-3. Click "Book now" → opens /login in NEW TAB
-4. Switch to new tab, wait for Angular to render login form
+3. Navigate to /login WITHIN the SPA (same tab, no new HTTP request)
+   - Strategy 1: Angular router via pushState + popstate (best - zero HTTP)
+   - Strategy 2: Remove target="_blank" from link, click in same tab
+   - Strategy 3: Direct page.goto as last resort
+4. Wait for Angular to render login form
 5. Enter email + password
 6. Turnstile appears AFTER entering credentials → solve it
 7. Click "Sign In"
@@ -101,9 +104,15 @@ class LoginAutomation:
             await self._handle_cookie_consent(page)
 
             # ============================================================
-            # Step 3: Click "Book now" → opens /login in a NEW TAB
+            # Step 3: Navigate to /login WITHIN the SPA (same tab)
+            # The "Book now" link has target="_blank" which opens a NEW TAB.
+            # New tabs make fresh HTTP requests → Cloudflare blocks with 403201.
+            # Instead, we stay in the original tab where Angular is loaded
+            # and use SPA navigation to avoid triggering Cloudflare entirely.
             # ============================================================
-            logger.info("Waiting for 'Book now' button...")
+            logger.info("Navigating to /login within the SPA (same tab)...")
+
+            # First, find "Book now" to confirm the page is ready
             book_now_selectors = [
                 "a.lets-get-started",
                 "a:has-text('Book now')",
@@ -129,50 +138,92 @@ class LoginAutomation:
             await self._remove_cookie_overlays(page)
             await self.browser.random_delay(500, 1000)
 
-            # Log the link attributes
             href = await book_now_btn.get_attribute("href")
             target = await book_now_btn.get_attribute("target")
             logger.info(f"Book now link - href: {href}, target: {target}")
 
-            # Click "Book now" - it opens /login in a new tab (this is normal VFS behavior)
-            # Use expect_page() to catch the new tab
-            login_page = None
+            # --- Strategy 1: Angular SPA navigation via pushState + popstate ---
+            # Angular's router listens for popstate events. This triggers
+            # client-side routing with ZERO HTTP requests to Cloudflare.
+            login_reached = False
             try:
-                async with page.context.expect_page(timeout=15000) as new_page_info:
-                    await book_now_btn.click(timeout=10000)
-                login_page = await new_page_info.value
-                logger.info(f"New tab opened: {login_page.url}")
-            except Exception as e:
-                logger.warning(f"No new tab opened ({e}), checking current page...")
+                logger.info("Attempting Angular SPA navigation (pushState + popstate)...")
+                await page.evaluate("""
+                    () => {
+                        window.history.pushState({}, '', '/ago/en/prt/login');
+                        window.dispatchEvent(new PopStateEvent('popstate'));
+                    }
+                """)
+                await self.browser.random_delay(3000, 5000)
 
-                # If no new tab, check if navigation happened in the same tab
                 if "/login" in page.url:
-                    login_page = page
-                    logger.info("Navigated to login in same tab")
+                    # Check if Angular actually rendered content (not just URL change)
+                    has_content = await page.evaluate("""
+                        () => {
+                            const body = document.body?.innerText || '';
+                            return body.length > 200 && !body.includes('"403201"');
+                        }
+                    """)
+                    if has_content:
+                        login_reached = True
+                        logger.info("SPA navigation to /login successful (Angular rendered)")
+                    else:
+                        logger.warning("URL changed but Angular may not have rendered login form")
+            except Exception as e:
+                logger.warning(f"SPA pushState navigation failed: {e}")
 
-            # If new tab opened, switch to it
-            if login_page and login_page != page:
-                logger.info("Switching to login tab...")
-                self.browser._page = login_page
-                page = login_page
+            # --- Strategy 2: Click link in same tab (remove target="_blank") ---
+            # Stays in same tab → reuses existing Cloudflare cf_clearance cookie
+            if not login_reached:
+                try:
+                    logger.info("Falling back to same-tab click (removing target=_blank)...")
+                    await page.evaluate("""
+                        () => {
+                            const links = document.querySelectorAll('a[target="_blank"]');
+                            for (const link of links) {
+                                if (link.href && (link.href.includes('/login') ||
+                                    link.classList.contains('lets-get-started'))) {
+                                    link.removeAttribute('target');
+                                }
+                            }
+                        }
+                    """)
+                    await self.browser.random_delay(300, 600)
 
-            # If still no login page, try fallback approaches
-            if not login_page or ("/login" not in page.url and "/login" not in (login_page.url if login_page else "")):
-                logger.warning("Book now click didn't open login page")
+                    # Re-find the button (DOM may have changed)
+                    for selector in book_now_selectors:
+                        try:
+                            book_now_btn = await page.wait_for_selector(selector, timeout=5000)
+                            if book_now_btn:
+                                break
+                        except:
+                            continue
 
-                # Fallback: try direct navigation
-                logger.info("Trying direct navigation to /login...")
+                    if book_now_btn:
+                        await book_now_btn.click(timeout=10000)
+                        await self.browser.random_delay(3000, 5000)
+                        if "/login" in page.url and not await self._is_blocked_page(page):
+                            login_reached = True
+                            logger.info("Same-tab click navigation to /login successful")
+                        elif await self._is_blocked_page(page):
+                            logger.warning("Same-tab click still got blocked by Cloudflare")
+                except Exception as e:
+                    logger.warning(f"Same-tab click failed: {e}")
+
+            # --- Strategy 3: Direct navigation (last resort) ---
+            if not login_reached:
+                logger.warning("SPA strategies failed, trying direct navigation as last resort...")
                 await page.goto(VFSUrls.LOGIN, wait_until="domcontentloaded", timeout=30000)
                 await self.browser.random_delay(3000, 5000)
 
                 if await self._is_blocked_page(page):
                     await self.browser.screenshot("login_blocked")
-                    return False, "Login page blocked by Cloudflare"
+                    return False, "Login page blocked by Cloudflare (all strategies failed)"
 
             # ============================================================
             # Step 4: Wait for Angular to render the login form
-            # Angular takes time to bootstrap in the new tab
-            # (Screenshots show: loading spinner → template placeholders → full form)
+            # After SPA navigation, Angular needs time to render the component
+            # (loading spinner → template placeholders → full form)
             # ============================================================
             logger.info("Waiting for login form to render...")
             await self.browser.random_delay(3000, 5000)
