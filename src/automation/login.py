@@ -104,15 +104,14 @@ class LoginAutomation:
             await self._handle_cookie_consent(page)
 
             # ============================================================
-            # Step 3: Navigate to /login WITHIN the SPA (same tab)
+            # Step 3: Navigate to /login in SAME TAB (avoid new tab → 403)
             # The "Book now" link has target="_blank" which opens a NEW TAB.
-            # New tabs make fresh HTTP requests → Cloudflare blocks with 403201.
-            # Instead, we stay in the original tab where Angular is loaded
-            # and use SPA navigation to avoid triggering Cloudflare entirely.
+            # New tabs send Sec-Fetch-Site:none + no Referer → Cloudflare 403.
+            # Same-tab navigation sends Sec-Fetch-Site:same-origin + Referer
+            # plus the existing cf_clearance cookie → passes Cloudflare.
             # ============================================================
-            logger.info("Navigating to /login within the SPA (same tab)...")
+            logger.info("Navigating to /login in same tab...")
 
-            # First, find "Book now" to confirm the page is ready
             book_now_selectors = [
                 "a.lets-get-started",
                 "a:has-text('Book now')",
@@ -142,77 +141,51 @@ class LoginAutomation:
             target = await book_now_btn.get_attribute("target")
             logger.info(f"Book now link - href: {href}, target: {target}")
 
-            # --- Strategy 1: Angular SPA navigation via pushState + popstate ---
-            # Angular's router listens for popstate events. This triggers
-            # client-side routing with ZERO HTTP requests to Cloudflare.
+            # --- Strategy 1: Remove target="_blank" and click in same tab ---
+            # This makes a real HTTP navigation with proper headers:
+            #   Sec-Fetch-Site: same-origin (not "none" like new tab)
+            #   Referer: .../book-an-appointment
+            #   Cookie: cf_clearance=... (from initial page load)
             login_reached = False
             try:
-                logger.info("Attempting Angular SPA navigation (pushState + popstate)...")
+                logger.info("Removing target=_blank from Book Now link...")
                 await page.evaluate("""
                     () => {
-                        window.history.pushState({}, '', '/ago/en/prt/login');
-                        window.dispatchEvent(new PopStateEvent('popstate'));
-                    }
-                """)
-                await self.browser.random_delay(3000, 5000)
-
-                if "/login" in page.url:
-                    # Check if Angular actually rendered content (not just URL change)
-                    has_content = await page.evaluate("""
-                        () => {
-                            const body = document.body?.innerText || '';
-                            return body.length > 200 && !body.includes('"403201"');
-                        }
-                    """)
-                    if has_content:
-                        login_reached = True
-                        logger.info("SPA navigation to /login successful (Angular rendered)")
-                    else:
-                        logger.warning("URL changed but Angular may not have rendered login form")
-            except Exception as e:
-                logger.warning(f"SPA pushState navigation failed: {e}")
-
-            # --- Strategy 2: Click link in same tab (remove target="_blank") ---
-            # Stays in same tab → reuses existing Cloudflare cf_clearance cookie
-            if not login_reached:
-                try:
-                    logger.info("Falling back to same-tab click (removing target=_blank)...")
-                    await page.evaluate("""
-                        () => {
-                            const links = document.querySelectorAll('a[target="_blank"]');
-                            for (const link of links) {
-                                if (link.href && (link.href.includes('/login') ||
-                                    link.classList.contains('lets-get-started'))) {
-                                    link.removeAttribute('target');
-                                }
+                        const links = document.querySelectorAll('a[target="_blank"]');
+                        for (const link of links) {
+                            if (link.href && (link.href.includes('/login') ||
+                                link.classList.contains('lets-get-started'))) {
+                                link.removeAttribute('target');
                             }
                         }
-                    """)
-                    await self.browser.random_delay(300, 600)
+                    }
+                """)
+                await self.browser.random_delay(300, 600)
 
-                    # Re-find the button (DOM may have changed)
-                    for selector in book_now_selectors:
-                        try:
-                            book_now_btn = await page.wait_for_selector(selector, timeout=5000)
-                            if book_now_btn:
-                                break
-                        except:
-                            continue
+                # Click the modified link - navigates in same tab
+                await book_now_btn.click(timeout=10000)
 
-                    if book_now_btn:
-                        await book_now_btn.click(timeout=10000)
-                        await self.browser.random_delay(3000, 5000)
-                        if "/login" in page.url and not await self._is_blocked_page(page):
-                            login_reached = True
-                            logger.info("Same-tab click navigation to /login successful")
-                        elif await self._is_blocked_page(page):
-                            logger.warning("Same-tab click still got blocked by Cloudflare")
-                except Exception as e:
-                    logger.warning(f"Same-tab click failed: {e}")
+                # Wait for full page load (this is a real HTTP navigation)
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=30000)
+                except:
+                    pass
+                await self.browser.random_delay(3000, 5000)
 
-            # --- Strategy 3: Direct navigation (last resort) ---
+                if "/login" in page.url and not await self._is_blocked_page(page):
+                    login_reached = True
+                    logger.info(f"Same-tab navigation to /login successful. URL: {page.url}")
+                elif await self._is_blocked_page(page):
+                    logger.warning("Same-tab click got blocked by Cloudflare")
+                    await self.browser.screenshot("same_tab_blocked")
+                else:
+                    logger.warning(f"After click, unexpected URL: {page.url}")
+            except Exception as e:
+                logger.warning(f"Same-tab click failed: {e}")
+
+            # --- Strategy 2: Direct page.goto (last resort) ---
             if not login_reached:
-                logger.warning("SPA strategies failed, trying direct navigation as last resort...")
+                logger.warning("Same-tab click failed, trying direct navigation...")
                 await page.goto(VFSUrls.LOGIN, wait_until="domcontentloaded", timeout=30000)
                 await self.browser.random_delay(3000, 5000)
 
