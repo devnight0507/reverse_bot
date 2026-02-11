@@ -295,6 +295,14 @@ class LoginAutomation:
                 return False, f"Login form not found. URL: {page.url}"
 
             # ============================================================
+            # Step 4b: Handle cookie consent on login page
+            # The consent banner reappears after full page navigation
+            # and its overlay blocks all clicks on form elements
+            # ============================================================
+            await self._handle_cookie_consent(page)
+            await self._remove_cookie_overlays(page)
+
+            # ============================================================
             # Step 5: Enter email + password
             # ============================================================
             logger.info("Entering email...")
