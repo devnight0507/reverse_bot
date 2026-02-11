@@ -593,15 +593,31 @@ class LoginAutomation:
 
             # Search for recent VFS emails (last 5 minutes)
             date_str = (datetime.now() - timedelta(minutes=5)).strftime("%d-%b-%Y")
-            _, message_ids = imap.search(None, f'(SINCE "{date_str}" FROM "vfsglobal")')
 
-            if not message_ids[0]:
+            # VFS sends OTP from info@vfshelpline.com (display name "VFS Global")
+            # Try multiple search terms to match
+            message_ids_list = []
+            for search_from in ["vfshelpline", "vfs"]:
+                _, message_ids = imap.search(None, f'(SINCE "{date_str}" FROM "{search_from}")')
+                if message_ids[0]:
+                    message_ids_list = message_ids[0].split()
+                    logger.info(f"Found {len(message_ids_list)} emails matching FROM '{search_from}'")
+                    break
+
+            # Fallback: search by subject containing OTP
+            if not message_ids_list:
+                _, message_ids = imap.search(None, f'(SINCE "{date_str}" SUBJECT "OTP")')
+                if message_ids[0]:
+                    message_ids_list = message_ids[0].split()
+                    logger.info(f"Found {len(message_ids_list)} emails matching SUBJECT 'OTP'")
+
+            if not message_ids_list:
                 logger.info("No recent VFS emails found")
                 imap.logout()
                 return None
 
             # Get the latest email
-            latest_id = message_ids[0].split()[-1]
+            latest_id = message_ids_list[-1]
             _, msg_data = imap.fetch(latest_id, "(RFC822)")
 
             msg = email_lib.message_from_bytes(msg_data[0][1])
