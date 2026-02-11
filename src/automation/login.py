@@ -759,24 +759,29 @@ class LoginAutomation:
             return False
 
     async def _handle_cookie_consent(self, page: Page):
-        """Handle cookie consent popup - click 'Accept All Cookies'"""
+        """Handle cookie consent popup - click 'Accept All Cookies'
+
+        OneTrust banner loads asynchronously and can be slow on poor connections.
+        Must always attempt removal even if detection times out, because the
+        overlay blocks ALL clicks on page elements (Book now, email input, etc.)
+        """
         try:
-            # Wait for cookie banner (from Screenshot 4: banner appears at bottom)
+            # Wait for cookie banner (OneTrust loads async, can be slow)
             try:
                 await page.wait_for_selector(
                     "#onetrust-banner-sdk, #onetrust-consent-sdk, .onetrust-pc-dark-filter",
-                    timeout=8000
+                    timeout=15000
                 )
                 logger.info("Cookie consent element detected")
             except:
-                logger.debug("No cookie consent elements found")
-                return
+                logger.debug("Cookie consent wait timed out, trying to dismiss anyway...")
 
-            # From Screenshot 5: "Accept All Cookies" button
+            # Try to click Accept button with multiple selectors
             button_selectors = [
                 "#onetrust-accept-btn-handler",
                 "button:has-text('Accept All Cookies')",
                 "button:has-text('Aceitar todos os cookies')",
+                "button:has-text('Aceitar todos')",
                 "button:has-text('Accept All')",
                 "#accept-recommended-btn-handler",
             ]
@@ -794,13 +799,44 @@ class LoginAutomation:
                 except:
                     continue
 
-            # Always remove blocking overlays via JS
+            # If no button found via selector, try clicking via JS
+            if not button_clicked:
+                try:
+                    clicked = await page.evaluate("""
+                        () => {
+                            const btn = document.getElementById('onetrust-accept-btn-handler');
+                            if (btn) { btn.click(); return true; }
+                            // Try finding by text content
+                            const buttons = document.querySelectorAll('button');
+                            for (const b of buttons) {
+                                const text = b.innerText.toLowerCase();
+                                if (text.includes('aceitar todos') || text.includes('accept all')) {
+                                    b.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }
+                    """)
+                    if clicked:
+                        logger.info("Cookie consent handled via JS click")
+                        button_clicked = True
+                        await self.browser.random_delay(1000, 2000)
+                except:
+                    pass
+
+            # ALWAYS remove blocking overlays via JS (even if button was clicked)
             await self._remove_cookie_overlays(page)
 
             if not button_clicked:
-                logger.warning("No cookie buttons matched, overlays removed via JS")
+                logger.warning("No cookie buttons found, overlays force-removed via JS")
 
         except Exception as e:
+            # Even on error, try to remove overlays
+            try:
+                await self._remove_cookie_overlays(page)
+            except:
+                pass
             logger.debug(f"Cookie consent handling: {e}")
 
     async def _remove_cookie_overlays(self, page: Page):
@@ -808,10 +844,23 @@ class LoginAutomation:
         try:
             await page.evaluate("""
                 () => {
+                    // Remove dark overlay filter
                     document.querySelectorAll('.onetrust-pc-dark-filter').forEach(el => el.remove());
+                    // Hide entire OneTrust SDK container
                     const sdk = document.getElementById('onetrust-consent-sdk');
-                    if (sdk) sdk.style.display = 'none';
+                    if (sdk) sdk.remove();
+                    // Remove banner
+                    const banner = document.getElementById('onetrust-banner-sdk');
+                    if (banner) banner.remove();
+                    // Remove any remaining onetrust filter elements
                     document.querySelectorAll('[class*="onetrust"][class*="filter"]').forEach(el => el.remove());
+                    // Remove any fixed/sticky overlays that might block interactions
+                    document.querySelectorAll('[class*="onetrust"]').forEach(el => {
+                        const style = window.getComputedStyle(el);
+                        if (style.position === 'fixed' || style.position === 'sticky') {
+                            el.remove();
+                        }
+                    });
                 }
             """)
             logger.debug("Cookie overlays removed")
