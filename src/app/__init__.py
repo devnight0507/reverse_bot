@@ -1,7 +1,7 @@
 """
 VFS Booking Bot - Application Package
 """
-from .config import settings, VFSUrls, Selectors
+from .config import settings, VFSUrls, Selectors, VISA_CATEGORIES
 from .database import init_db, get_session, Base
 from .models import Applicant, Booking, BookingLog, Session, Settings
 

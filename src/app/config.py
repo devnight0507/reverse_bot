@@ -65,9 +65,14 @@ class VFSUrls:
     """VFS Global Portugal (Angola) URLs"""
     BASE = "https://visa.vfsglobal.com/ago/en/prt"
     LOGIN = f"{BASE}/login"
-    APPLICATION_DETAIL = f"{BASE}/application-detail"  # Redirects to /login via Angular auth guard
+    APPLICATION_DETAIL = f"{BASE}/application-detail"
     DASHBOARD = f"{BASE}/dashboard"
     BOOK_APPOINTMENT = f"{BASE}/book-an-appointment"
+    YOUR_DETAILS = f"{BASE}/your-details"
+    BOOK_APPOINTMENT_PAGE = f"{BASE}/book-appointment"
+    REVIEW_PAY = f"{BASE}/review-pay"
+    CONFIRMATION = f"{BASE}/confirmation"
+    IDENTITY_VERIFICATION = "https://idnvui.vfsglobal.com/home"
 
 
 # CSS Selectors for VFS Global site
@@ -99,6 +104,9 @@ class Selectors:
     CATEGORY_SELECT = "mat-select[formcontrolname='category']"
     SUBCATEGORY_SELECT = "mat-select[formcontrolname='subCategory']"
 
+    # Booking Form - Payment Mode
+    PAYMENT_MODE_SELECT = "mat-select[formcontrolname='paymentMode'], mat-select[formcontrolname='payment']"
+
     # Booking Form - Applicant Details
     FIRST_NAME = "input[formcontrolname='firstName']"
     LAST_NAME = "input[formcontrolname='lastName']"
@@ -112,39 +120,56 @@ class Selectors:
     EMAIL = "input[formcontrolname='emailId']"
     CONFIRM_EMAIL = "input[formcontrolname='confirmEmailId']"
 
-    # Slot Selection
-    AVAILABLE_DATE = ".date-available"
-    TIME_SLOT = ".time-slot"
-    CALENDAR_NEXT = "button[aria-label='Next month']"
+    # Slot Availability (application-detail page)
+    NO_SLOTS_MESSAGE = ".alert.alert-info, .alert-info, .info-alert"
+    EARLIEST_SLOT_TEXT = "text=Earliest available slot"
+    CONTINUE_BUTTON = "button:has-text('Continue')"
 
-    # Confirmation
-    TERMS_CHECKBOX = "mat-checkbox[formcontrolname='termsAccepted']"
-    CONFIRM_BUTTON = "button:has-text('Confirm')"
-    PAY_BUTTON = "button:has-text('Pay')"
+    # Calendar / Slot Selection (book-appointment page)
+    APPOINTMENT_TYPE_SELECT = "mat-select, select"
+    AVAILABLE_DATE = "td:not(.disabled):not(.unavailable) .day, td.available, .date-available, td:not([class*='disabled']):not([class*='unavailable'])"
+    TIME_SLOT_SELECT = "button:has-text('Select')"
+    LOAD_MORE = "a:has-text('Load More'), button:has-text('Load More')"
+    CALENDAR_NEXT = "button[aria-label='Next month'], button:has-text('>')"
+
+    # Review & Payment (review-pay page)
+    TERMS_CHECKBOX_1 = "mat-checkbox:has-text('Terms and Conditions'), mat-checkbox:first-of-type"
+    TERMS_CHECKBOX_2 = "mat-checkbox:has-text('communication'), mat-checkbox:has-text('agree'), mat-checkbox:last-of-type"
+    PAYMENT_BUTTON = "button:has-text('Multicaixa'), button:has-text('Pay'), button:has-text('Confirm')"
+
+    # Booking OTP (your-details page, after identity verification)
+    GENERATE_OTP_BUTTON = "button:has-text('Generate OTP'), button:has-text('Generate')"
+    BOOKING_OTP_INPUT = "input[formcontrolname='otp'], input[placeholder*='OTP'], input[type='text']"
+    VERIFY_OTP_BUTTON = "button:has-text('Verify')"
+
+    # Identity Verification Status
+    VERIFICATION_PENDING = "text=Verification pending"
+    VERIFICATION_PASSED = "text=Verification Passed"
+
+    # Modals & Buttons
+    SAVE_BUTTON = "button:has-text('Save')"
+    GO_BACK_BUTTON = "button:has-text('Go Back')"
 
     # Status Messages
-    NO_SLOTS_MESSAGE = ".alert.alert-info"
-    SUCCESS_MESSAGE = ".alert.alert-success"
-    ERROR_MESSAGE = ".alert.alert-danger"
+    SUCCESS_MESSAGE = ".alert.alert-success, .alert-success"
+    ERROR_MESSAGE = ".alert.alert-danger, .alert-danger"
 
     # Turnstile
     TURNSTILE_IFRAME = "iframe[src*='challenges.cloudflare.com']"
+    TURNSTILE_WIDGET = ".cf-turnstile, [data-sitekey]"
     TURNSTILE_CHECKBOX = "#challenge-stage"
 
     # Loading
-    SPINNER = ".mat-progress-spinner"
-    LOADING = ".loading"
+    SPINNER = ".mat-progress-spinner, .mat-spinner"
+    LOADING = ".loading, .loader"
 
 
-# Visa Types
-VISA_TYPES = [
-    "TOURIST",
-    "BUSINESS",
-    "STUDENT",
-    "WORK",
-    "FAMILY",
-    "TRANSIT",
-]
+# Visa Categories (actual VFS Angola values from screenshots)
+VISA_CATEGORIES = {
+    "Job Seeker": ["Job seekers"],
+    "Visto Nacional": ["Visto Nacional (National visa)"],
+    "Visto Schengen": ["Visto Schengen (Schengen Visa)"],
+}
 
 # Applicant Status
 APPLICANT_STATUS = [

@@ -6,6 +6,7 @@ from .login import LoginAutomation
 from .turnstile import TurnstileSolver
 from .booking import BookingAutomation
 from .monitor import SlotMonitor
+from .identity_verification import IdentityVerificationHandler
 
 __all__ = [
     "BrowserManager",
@@ -13,4 +14,5 @@ __all__ = [
     "TurnstileSolver",
     "BookingAutomation",
     "SlotMonitor",
+    "IdentityVerificationHandler",
 ]

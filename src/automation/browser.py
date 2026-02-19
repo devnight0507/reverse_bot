@@ -26,7 +26,7 @@ from ..app.config import settings
 class BrowserManager:
     """Manages browser lifecycle with stealth anti-detection"""
 
-    def __init__(self):
+    def __init__(self, fake_video_path: Optional[str] = None):
         self._playwright = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
@@ -35,6 +35,7 @@ class BrowserManager:
         self._is_cdp = False
         self._session_file = settings.base_dir / "data" / "session.json"
         self._chrome_profile_dir = settings.base_dir / "data" / "chrome_profile"
+        self._fake_video_path = fake_video_path
 
     async def start(self) -> Page:
         """Start browser - uses CDP connection for best anti-detection"""
@@ -95,6 +96,25 @@ class BrowserManager:
                 logger.warning(f"Could not clean Chrome profile: {e}")
         self._chrome_profile_dir.mkdir(parents=True, exist_ok=True)
 
+        # Write Chrome preferences to suppress password dialogs, infobars etc.
+        default_dir = self._chrome_profile_dir / "Default"
+        default_dir.mkdir(parents=True, exist_ok=True)
+        prefs_file = default_dir / "Preferences"
+        import json
+        prefs = {
+            "credentials_enable_service": False,
+            "profile": {
+                "password_manager_enabled": False,
+                "default_content_setting_values": {
+                    "notifications": 2  # Block notifications
+                }
+            },
+            "autofill": {
+                "profile_enabled": False
+            }
+        }
+        prefs_file.write_text(json.dumps(prefs))
+
         # Launch Chrome as a NORMAL process - no automation flags whatsoever
         args = [
             chrome_path,
@@ -110,7 +130,23 @@ class BrowserManager:
             "--disable-popup-blocking",
             "--disable-sync",
             "--metrics-recording-only",
+            "--disable-features=PasswordManager,PasswordManagerOnboarding,PasswordGeneration",
+            "--no-pings",
         ]
+
+        # Add fake video camera flags for identity verification
+        # This feeds a pre-recorded video to getUserMedia() instead of real webcam
+        if self._fake_video_path:
+            video_path = Path(self._fake_video_path)
+            if video_path.exists():
+                args.extend([
+                    "--use-fake-device-for-media-stream",
+                    "--use-fake-ui-for-media-stream",
+                    f"--use-file-for-fake-video-capture={video_path}",
+                ])
+                logger.info(f"Fake video camera enabled: {video_path}")
+            else:
+                logger.warning(f"Fake video file not found: {video_path}")
 
         if settings.headless:
             args.append("--headless=new")
@@ -153,14 +189,26 @@ class BrowserManager:
 
     async def _start_regular(self):
         """Regular Playwright launch (fallback when system Chrome not found)"""
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--window-size=1920,1080",
+        ]
+
+        # Add fake video flags if configured
+        if self._fake_video_path:
+            video_path = Path(self._fake_video_path)
+            if video_path.exists():
+                launch_args.extend([
+                    "--use-fake-device-for-media-stream",
+                    "--use-fake-ui-for-media-stream",
+                    f"--use-file-for-fake-video-capture={video_path}",
+                ])
+
         self._browser = await self._playwright.chromium.launch(
             headless=settings.headless,
             channel="chrome",
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-                "--window-size=1920,1080",
-            ],
+            args=launch_args,
             ignore_default_args=["--enable-automation"],
         )
 

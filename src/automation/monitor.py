@@ -59,8 +59,8 @@ class SlotMonitor:
         self,
         applicants: List[Dict],
         center: str = "Luanda",
-        category: str = "Short Stay",
-        subcategory: str = "Tourism",
+        category: str = "Visto Schengen",
+        subcategory: str = "Visto Schengen (Schengen Visa)",
         interval: Optional[int] = None,
         auto_book: bool = True,
     ):
@@ -70,7 +70,7 @@ class SlotMonitor:
         Args:
             applicants: List of applicant data dictionaries
             center: Visa application center
-            category: Visa category
+            category: Visa category (Job Seeker / Visto Nacional / Visto Schengen)
             subcategory: Visa subcategory
             interval: Check interval in seconds (uses config if not provided)
             auto_book: Automatically book when slot is found
@@ -85,17 +85,31 @@ class SlotMonitor:
 
         logger.info(f"Starting slot monitor (interval: {interval}s, auto_book: {auto_book})")
         logger.info(f"Monitoring for {len(applicants)} applicants")
+        logger.info(f"Category: {category} / {subcategory}")
 
         try:
-            # Login first (don't check dashboard before login - causes Session Expired)
+            # Login first
             logger.info("Logging in...")
             success, message = await self.login.login()
             if not success:
-                logger.error(f"Login failed: {message}")
-                if self.on_error:
-                    await self._call_callback(self.on_error, "login_failed", message)
-                self._running = False
-                return
+                if "ACCOUNT_LOCKED" in message:
+                    logger.error("Account locked by VFS! Waiting 2 hours before retrying...")
+                    if self.on_error:
+                        await self._call_callback(self.on_error, "account_locked", message)
+                    await asyncio.sleep(7200)
+                    success, message = await self.login.login()
+                    if not success:
+                        logger.error(f"Login still failed after cooldown: {message}")
+                        if self.on_error:
+                            await self._call_callback(self.on_error, "login_failed", message)
+                        self._running = False
+                        return
+                else:
+                    logger.error(f"Login failed: {message}")
+                    if self.on_error:
+                        await self._call_callback(self.on_error, "login_failed", message)
+                    self._running = False
+                    return
 
             # Start monitoring loop
             while self._running:
@@ -113,10 +127,15 @@ class SlotMonitor:
                     success, message = await self.booking.start_new_booking()
                     if not success:
                         logger.warning(f"Failed to start booking: {message}")
-                        # Try to re-login
-                        success, _ = await self.login.login()
+                        success, msg = await self.login.login()
                         if not success:
-                            await asyncio.sleep(interval)
+                            if "ACCOUNT_LOCKED" in msg:
+                                logger.error("Account locked during monitoring! Waiting 2 hours...")
+                                if self.on_error:
+                                    await self._call_callback(self.on_error, "account_locked", msg)
+                                await asyncio.sleep(7200)
+                            else:
+                                await asyncio.sleep(interval)
                             continue
 
                     # Select center and category
@@ -132,49 +151,115 @@ class SlotMonitor:
                         await asyncio.sleep(interval)
                         continue
 
-                    # Check availability
-                    available, message, dates = await self.booking.check_slot_availability()
+                    # Select payment mode
+                    success, message = await self.booking.select_payment_mode()
+                    if not success:
+                        logger.warning(f"Failed to select payment mode: {message}")
+                        await asyncio.sleep(interval)
+                        continue
 
-                    if available and dates:
+                    # Check availability
+                    available, message, earliest = await self.booking.check_slot_availability()
+
+                    if available:
                         self._slot_found_count += 1
-                        logger.info(f"SLOTS FOUND! {len(dates)} available dates")
+                        logger.info(f"SLOTS FOUND! Earliest: {earliest}")
 
                         # Notify callback
                         if self.on_slot_found:
                             await self._call_callback(
                                 self.on_slot_found,
                                 "slot_found",
-                                {"dates": dates, "count": len(dates)}
+                                {"earliest": earliest, "message": message}
                             )
 
                         if auto_book:
-                            # Try to book for each applicant
+                            # Try full booking for each pending applicant
                             for applicant in applicants:
                                 if applicant.get("status") in ["booked", "cancelled"]:
                                     continue
 
-                                logger.info(f"Attempting to book for {applicant.get('first_name')}")
+                                logger.info(f"Attempting full booking for {applicant.get('first_name')}")
 
-                                # Fill details and book
+                                # Click Continue to proceed from slot availability
+                                success, msg = await self.booking.click_continue_after_slots()
+                                if not success:
+                                    logger.warning(f"Failed to continue: {msg}")
+                                    continue
+
+                                # Fill and save applicant details
                                 success, msg = await self.booking.fill_applicant_details(applicant)
                                 if not success:
                                     continue
 
+                                success, msg = await self.booking.save_applicant_details()
+                                if not success:
+                                    continue
+
+                                # Handle modals
+                                await self.booking.handle_reminder_modal()
+                                await self.booking.handle_service_fee_notice()
+
+                                # Identity verification
+                                success, msg = await self.booking.handle_identity_verification()
+                                if not success:
+                                    logger.warning(f"Verification failed: {msg}")
+                                    continue
+
+                                # Wait for verification
+                                success, msg = await self.booking.wait_for_verification_passed()
+                                if not success:
+                                    continue
+
+                                # Click Continue after verification
+                                page = self.browser.page
+                                if page:
+                                    from ..app.config import Selectors
+                                    cont_btn = await page.query_selector(Selectors.CONTINUE_BUTTON)
+                                    if cont_btn:
+                                        try:
+                                            if await cont_btn.is_visible():
+                                                await cont_btn.click()
+                                                await self.browser.random_delay(2000, 3000)
+                                        except:
+                                            pass
+
+                                # Booking OTP
+                                success, msg = await self.booking.handle_booking_otp()
+                                if not success:
+                                    continue
+
+                                # Turnstile #3
+                                success, msg = await self.booking.solve_booking_turnstile()
+                                if not success:
+                                    continue
+
+                                # Select appointment type
+                                await self.booking.select_appointment_type()
+
+                                # Select slot
                                 success, msg = await self.booking.select_slot()
                                 if not success:
                                     continue
 
-                                success, msg, code = await self.booking.confirm_booking()
+                                # Review & payment
+                                success, msg = await self.booking.handle_review_and_payment()
+                                if not success:
+                                    continue
+
+                                # Get confirmation
+                                success, msg, confirmation = await self.booking.get_confirmation()
                                 if success:
-                                    logger.info(f"Booking successful for {applicant.get('first_name')}: {code}")
+                                    ref = confirmation.get("appointment_ref") or confirmation.get("reference_number") if confirmation else None
+                                    logger.info(f"Booking successful for {applicant.get('first_name')}: {ref}")
                                     applicant["status"] = "booked"
-                                    applicant["confirmation_code"] = code
+                                    applicant["confirmation"] = confirmation
 
                                     if self.on_slot_found:
                                         await self._call_callback(
                                             self.on_slot_found,
                                             "booking_success",
-                                            {"applicant": applicant, "code": code}
+                                            {"applicant": applicant, "confirmation": confirmation}
                                         )
 
                                     # Check if all applicants are booked
@@ -226,18 +311,13 @@ class SlotMonitor:
     async def check_once(
         self,
         center: str = "Luanda",
-        category: str = "Short Stay",
-        subcategory: str = "Tourism",
+        category: str = "Visto Schengen",
+        subcategory: str = "Visto Schengen (Schengen Visa)",
     ) -> Dict:
-        """
-        Perform single slot check
-
-        Returns:
-            Dict with check results
-        """
+        """Perform single slot check"""
         result = {
             "available": False,
-            "dates": [],
+            "earliest": None,
             "message": "",
             "checked_at": datetime.utcnow(),
         }
@@ -268,10 +348,16 @@ class SlotMonitor:
                 result["message"] = message
                 return result
 
+            # Select payment mode
+            success, message = await self.booking.select_payment_mode()
+            if not success:
+                result["message"] = message
+                return result
+
             # Check availability
-            available, message, dates = await self.booking.check_slot_availability()
+            available, message, earliest = await self.booking.check_slot_availability()
             result["available"] = available
-            result["dates"] = [d.isoformat() for d in dates]
+            result["earliest"] = earliest
             result["message"] = message
 
             return result
