@@ -251,6 +251,8 @@ class LoginAutomation:
             # Step 4: Wait for Angular to render the login form
             # After SPA navigation, Angular needs time to render the component
             # (loading spinner → template placeholders → full form)
+            # CRITICAL: Angular may redirect /login → /page-not-found if session
+            # data is stale. Must detect and recover from this.
             # ============================================================
             logger.info("Waiting for login form to render...")
             await self.browser.random_delay(3000, 5000)
@@ -259,6 +261,94 @@ class LoginAutomation:
             if await self._is_blocked_page(page):
                 await self.browser.screenshot("login_page_blocked")
                 return False, "Login page blocked by Cloudflare (403201)"
+
+            # Check if Angular redirected to session expired page
+            # This happens when /login detects stale session tokens in the
+            # Chrome profile (indexedDB, service workers, etc.) that weren't
+            # cleared by cookie/localStorage clearing alone.
+            if await self._is_session_expired_page(page):
+                logger.warning("Session expired after navigating to /login! Clearing all data and retrying...")
+                await self.browser.screenshot("session_expired_after_login_nav")
+
+                # Aggressive cleanup: clear everything
+                await self._clear_all_storage(page)
+
+                # Delete Chrome profile to remove ALL persistent state
+                try:
+                    chrome_profile = self.browser._chrome_profile_dir
+                    if chrome_profile.exists():
+                        import shutil
+                        shutil.rmtree(chrome_profile, ignore_errors=True)
+                        chrome_profile.mkdir(parents=True, exist_ok=True)
+                        logger.info("Chrome profile deleted for clean restart")
+                except Exception as e:
+                    logger.warning(f"Could not delete Chrome profile: {e}")
+
+                # Restart browser and retry login once
+                logger.info("Restarting browser for clean session...")
+                try:
+                    await self.browser.stop()
+                    await asyncio.sleep(3)
+                    await self.browser.start()
+                    page = self.browser.page
+
+                    # Navigate fresh to /book-an-appointment
+                    await page.goto(VFSUrls.BOOK_APPOINTMENT, wait_until="domcontentloaded", timeout=30000)
+                    await self.browser.random_delay(5000, 8000)
+
+                    if await self._is_session_expired_page(page):
+                        await self.browser.screenshot("still_expired_after_restart")
+                        return False, "Session expired persists after browser restart. Wait 1 hour."
+
+                    # Handle cookie consent
+                    await self._handle_cookie_consent(page)
+
+                    # Retry navigation to /login
+                    book_now_btn = None
+                    for sel in ["a:has-text('Book now')", "a:has-text('Book Now')", "a.lets-get-started"]:
+                        try:
+                            book_now_btn = await page.wait_for_selector(sel, timeout=10000)
+                            if book_now_btn:
+                                break
+                        except:
+                            continue
+
+                    if book_now_btn:
+                        await self._remove_cookie_overlays(page)
+                        await page.evaluate("""
+                            () => {
+                                const links = document.querySelectorAll('a[target="_blank"]');
+                                for (const link of links) {
+                                    if (link.href && (link.href.includes('/login') ||
+                                        link.classList.contains('lets-get-started'))) {
+                                        link.removeAttribute('target');
+                                    }
+                                }
+                                window.open = function(url) {
+                                    window.location.href = url;
+                                    return window;
+                                };
+                            }
+                        """)
+                        await book_now_btn.click(timeout=10000)
+                        try:
+                            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+                        except:
+                            pass
+                        await self.browser.random_delay(3000, 5000)
+
+                        # Check again
+                        if await self._is_session_expired_page(page):
+                            return False, "Session expired persists. VFS may be rate-limiting. Wait 1 hour."
+
+                        if "/login" not in page.url:
+                            return False, f"Could not reach login page after restart. URL: {page.url}"
+                    else:
+                        return False, "Could not find Book now button after restart"
+
+                except Exception as e:
+                    logger.error(f"Browser restart failed: {e}")
+                    return False, f"Browser restart failed: {str(e)}"
 
             await self.browser.screenshot("login_page_loaded")
             logger.info(f"Current URL: {page.url}")
