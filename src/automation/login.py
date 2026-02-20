@@ -92,11 +92,6 @@ class LoginAutomation:
                 await page.goto(VFSUrls.BOOK_APPOINTMENT, wait_until="domcontentloaded", timeout=30000)
                 await self.browser.random_delay(5000, 8000)
 
-                # Check for account locked (429202) - STOP immediately, don't retry
-                if await self._is_account_locked(page):
-                    await self.browser.screenshot("account_locked")
-                    return False, "ACCOUNT_LOCKED: Too many requests. Account locked for 2 hours. Do NOT retry."
-
                 if await self._is_blocked_page(page):
                     logger.warning(f"Cloudflare 403 detected (attempt {attempt}/{max_retries})")
                     if attempt < max_retries:
@@ -114,11 +109,6 @@ class LoginAutomation:
                     await self._clear_all_storage(page)
                     await page.goto(VFSUrls.BOOK_APPOINTMENT, wait_until="domcontentloaded", timeout=30000)
                     await self.browser.random_delay(5000, 8000)
-
-                    # Check again after retry - might get locked now
-                    if await self._is_account_locked(page):
-                        await self.browser.screenshot("account_locked")
-                        return False, "ACCOUNT_LOCKED: Too many requests. Account locked for 2 hours. Do NOT retry."
 
                 page_loaded = True
                 break
@@ -705,37 +695,11 @@ class LoginAutomation:
         except:
             return False
 
-    async def _is_account_locked(self, page: Page) -> bool:
-        """Check if account is locked due to rate limiting (429202)"""
-        try:
-            content = await page.content()
-            content_lower = content.lower()
-            for indicator in [
-                "account locked",
-                "429202",
-                "multiple requests within a short period",
-                "temporary pause in access",
-                "cooldown period",
-                "access will automatically reset",
-            ]:
-                if indicator in content_lower:
-                    logger.warning("Account locked (429202) detected - rate limited by VFS")
-                    return True
-            return False
-        except:
-            return False
-
     async def _is_session_expired_page(self, page: Page) -> bool:
-        """Check if current page is the 'Session Expired' page (NOT account locked)"""
+        """Check if current page is the 'Session Expired' page"""
         try:
-            # First check if it's account locked - that takes priority
-            if await self._is_account_locked(page):
-                return False  # Not session expired - it's account locked
-
             url = page.url.lower()
             if "page-not-found" in url:
-                # Could be session expired OR account locked
-                # If we got here, _is_account_locked already returned False
                 return True
 
             content = await page.content()
