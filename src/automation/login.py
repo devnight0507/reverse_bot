@@ -64,22 +64,21 @@ class LoginAutomation:
             logger.info("Starting login process...")
 
             # ============================================================
-            # Step 0: Clear stale session data before login
-            # Critical for CDP mode which uses a persistent Chrome profile.
-            # Stale session tokens cause VFS to redirect to "Session Expired"
-            # or "page-not-found" with rate-limiting messages.
+            # Step 0: Check if already logged in (reuse existing session)
+            # DO NOT clear cookies here — the cf_clearance cookie from
+            # Cloudflare is precious. Clearing it makes every login look
+            # like a brand-new visitor, which triggers VFS rate limiting.
+            # Only clear if we detect the session is actually invalid.
             # ============================================================
-            logger.info("Clearing stale session data...")
             try:
-                await page.context.clear_cookies()
-                await page.evaluate("""
-                    () => {
-                        try { localStorage.clear(); } catch(e) {}
-                        try { sessionStorage.clear(); } catch(e) {}
-                    }
-                """)
-            except Exception:
-                pass  # Page might be on about:blank, that's OK
+                current_url = page.url
+                if current_url and "visa.vfsglobal.com" in current_url:
+                    # Already on VFS - check if session is valid
+                    if "/dashboard" in current_url:
+                        logger.info("Already on dashboard, session is valid")
+                        return True, "Already logged in"
+            except:
+                pass
 
             # ============================================================
             # Step 1: Navigate to /book-an-appointment (with retry)
@@ -105,10 +104,20 @@ class LoginAutomation:
                         return False, "Blocked by Cloudflare protection. Try again later."
 
                 if await self._is_session_expired_page(page):
-                    logger.info("Session expired page detected, clearing storage...")
-                    await self._clear_all_storage(page)
+                    logger.info("Session expired page detected, clearing VFS session data...")
+                    # Clear only VFS session data, KEEP Cloudflare cf_clearance cookie
+                    await self._clear_vfs_session(page)
+                    # Also invalidate saved session to prevent reloading stale cookies
+                    self.browser.invalidate_session()
+                    await self.browser.random_delay(3000, 5000)
                     await page.goto(VFSUrls.BOOK_APPOINTMENT, wait_until="domcontentloaded", timeout=30000)
                     await self.browser.random_delay(5000, 8000)
+
+                    # If still expired after clearing, this is IP-level rate limiting
+                    if await self._is_session_expired_page(page):
+                        logger.warning("Still session expired after clearing. VFS rate limiting this IP.")
+                        await self.browser.screenshot("rate_limited")
+                        return False, "VFS rate limiting. Wait 1 hour before retrying."
 
                 page_loaded = True
                 break
@@ -267,22 +276,12 @@ class LoginAutomation:
             # Chrome profile (indexedDB, service workers, etc.) that weren't
             # cleared by cookie/localStorage clearing alone.
             if await self._is_session_expired_page(page):
-                logger.warning("Session expired after navigating to /login! Clearing all data and retrying...")
+                logger.warning("Session expired after navigating to /login! Restarting with clean state...")
                 await self.browser.screenshot("session_expired_after_login_nav")
 
-                # Aggressive cleanup: clear everything
-                await self._clear_all_storage(page)
-
-                # Delete Chrome profile to remove ALL persistent state
-                try:
-                    chrome_profile = self.browser._chrome_profile_dir
-                    if chrome_profile.exists():
-                        import shutil
-                        shutil.rmtree(chrome_profile, ignore_errors=True)
-                        chrome_profile.mkdir(parents=True, exist_ok=True)
-                        logger.info("Chrome profile deleted for clean restart")
-                except Exception as e:
-                    logger.warning(f"Could not delete Chrome profile: {e}")
+                # Invalidate saved session to prevent stale cookies on restart
+                # (browser.start() will also clean Chrome profile)
+                self.browser.invalidate_session()
 
                 # Restart browser and retry login once
                 logger.info("Restarting browser for clean session...")
@@ -810,8 +809,40 @@ class LoginAutomation:
         except:
             return False
 
+    async def _clear_vfs_session(self, page: Page):
+        """Clear VFS session data but KEEP Cloudflare cookies (cf_clearance etc.)
+
+        The cf_clearance cookie proves we passed Cloudflare challenge.
+        Clearing it forces a new challenge and makes us look like a new visitor,
+        which triggers VFS rate limiting when done repeatedly.
+        """
+        try:
+            # Get all cookies, filter out Cloudflare ones
+            cookies = await page.context.cookies()
+            cf_cookies = [c for c in cookies if c["name"].startswith("cf_") or c["name"].startswith("__cf")]
+
+            # Clear all cookies
+            await page.context.clear_cookies()
+
+            # Restore Cloudflare cookies
+            if cf_cookies:
+                await page.context.add_cookies(cf_cookies)
+                logger.info(f"Preserved {len(cf_cookies)} Cloudflare cookies")
+
+            # Clear VFS app storage
+            await page.evaluate("""
+                () => {
+                    try { localStorage.clear(); } catch(e) {}
+                    try { sessionStorage.clear(); } catch(e) {}
+                }
+            """)
+
+            logger.info("Cleared VFS session data (Cloudflare cookies preserved)")
+        except Exception as e:
+            logger.debug(f"VFS session cleanup: {e}")
+
     async def _clear_all_storage(self, page: Page):
-        """Clear cookies, localStorage, and sessionStorage"""
+        """Clear ALL cookies, localStorage, and sessionStorage (nuclear option)"""
         try:
             await page.context.clear_cookies()
             await page.evaluate("""
@@ -826,7 +857,7 @@ class LoginAutomation:
                 import os
                 os.remove(session_file)
 
-            logger.info("Cleared all browser storage")
+            logger.info("Cleared ALL browser storage")
         except Exception as e:
             logger.debug(f"Storage cleanup: {e}")
 

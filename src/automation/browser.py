@@ -95,6 +95,16 @@ class BrowserManager:
                 logger.warning(f"Could not clean Chrome profile: {e}")
         self._chrome_profile_dir.mkdir(parents=True, exist_ok=True)
 
+        # Also delete stale session.json — if the Chrome profile is being
+        # cleaned, session cookies are definitely stale and would re-inject
+        # the very data we're trying to remove
+        if self._session_file.exists():
+            try:
+                os.remove(self._session_file)
+                logger.info("Deleted stale session.json")
+            except Exception as e:
+                logger.warning(f"Could not delete session.json: {e}")
+
         # Launch Chrome as a NORMAL process - no automation flags whatsoever
         args = [
             chrome_path,
@@ -446,6 +456,15 @@ class BrowserManager:
 
         except Exception as e:
             logger.error(f"Failed to load session: {e}")
+
+    def invalidate_session(self):
+        """Delete session.json to prevent stale cookies from being reloaded on restart"""
+        if self._session_file.exists():
+            try:
+                os.remove(self._session_file)
+                logger.info("Session invalidated (session.json deleted)")
+            except Exception as e:
+                logger.warning(f"Could not delete session.json: {e}")
 
     @property
     def page(self) -> Optional[Page]:
