@@ -492,50 +492,104 @@ class LoginAutomation:
             await self.browser.screenshot("login_error")
             return False, f"Login error: {str(e)}"
 
-    async def _wait_and_solve_turnstile(self, page: Page, timeout: int = 30) -> bool:
+    async def _wait_and_solve_turnstile(self, page: Page, timeout: int = 10) -> bool:
         """
         Wait for Turnstile to appear and solve it.
         Turnstile appears AFTER entering credentials on VFS login page.
         Returns True if Turnstile was found and solved.
+
+        Uses a SINGLE combined selector to avoid sequential timeouts
+        (3 selectors × 30s = 90s wasted when Turnstile doesn't appear).
         """
         try:
-            # Wait for Turnstile widget to appear
-            turnstile_selectors = [
+            # Wait for ANY Turnstile indicator with ONE timeout
+            combined_selector = ", ".join([
                 "iframe[src*='challenges.cloudflare.com']",
+                "iframe[src*='turnstile']",
                 ".cf-turnstile",
                 "[data-sitekey]",
-            ]
+                "[class*='turnstile']",
+                "#cf-turnstile",
+            ])
 
             turnstile_found = False
-            for selector in turnstile_selectors:
-                try:
-                    await page.wait_for_selector(selector, timeout=timeout * 1000)
+            try:
+                await page.wait_for_selector(combined_selector, timeout=timeout * 1000)
+                turnstile_found = True
+                logger.info("Turnstile widget detected")
+            except:
+                pass
+
+            if not turnstile_found:
+                # Also check by page content (Portuguese labels like "Verificando...")
+                has_turnstile = await page.evaluate("""
+                    () => {
+                        const text = document.body?.innerText || '';
+                        return text.includes('Verificando') ||
+                               text.includes('Verifying') ||
+                               text.includes('Falha na verificação') ||
+                               text.includes('verification failed') ||
+                               !!document.querySelector('iframe[src*="cloudflare"]');
+                    }
+                """)
+                if has_turnstile:
                     turnstile_found = True
-                    logger.info(f"Turnstile widget found: {selector}")
-                    break
-                except:
-                    continue
+                    logger.info("Turnstile detected via page content")
 
             if not turnstile_found:
                 return False
 
-            # Check if Turnstile auto-solved (shows "Success!" for real users)
-            await self.browser.random_delay(3000, 5000)
+            # Wait for Turnstile to auto-solve (CDP Chrome usually passes automatically)
+            # Check every 2 seconds for up to 30 seconds
+            for i in range(15):
+                await asyncio.sleep(2)
 
-            # Check for success state
-            success = await page.evaluate("""
-                () => {
-                    const body = document.body.innerText;
-                    return body.includes('Success') || body.includes('success');
-                }
-            """)
+                state = await page.evaluate("""
+                    () => {
+                        const text = document.body?.innerText || '';
+                        // Check if Sign In button is enabled (Turnstile passed)
+                        const btn = document.querySelector('button[type="submit"]');
+                        const btnEnabled = btn && !btn.disabled;
 
-            if success:
-                logger.info("Turnstile auto-solved (Success!)")
-                return True
+                        // Check for success indicators
+                        const hasSuccess = text.includes('Success') || text.includes('Sucesso');
 
-            # If not auto-solved, use 2Captcha API
-            logger.info("Turnstile not auto-solved, using 2Captcha...")
+                        // Check for failure
+                        const hasFailed = text.includes('Falha na verificação') ||
+                                         text.includes('verification failed');
+
+                        // Check if Turnstile widget is gone (auto-solved)
+                        const turnstileGone = !document.querySelector('.cf-turnstile') &&
+                                             !document.querySelector('iframe[src*="cloudflare"]');
+
+                        return { btnEnabled, hasSuccess, hasFailed, turnstileGone };
+                    }
+                """)
+
+                if state.get("hasSuccess") or state.get("turnstileGone"):
+                    logger.info("Turnstile auto-solved")
+                    return True
+
+                if state.get("btnEnabled"):
+                    logger.info("Sign In button enabled (Turnstile likely passed)")
+                    return True
+
+                if state.get("hasFailed"):
+                    logger.warning(f"Turnstile verification failed (attempt {i+1}/15)")
+                    # Try clicking the retry/refresh link if present
+                    try:
+                        retry_link = await page.query_selector(
+                            "a:has-text('Solução de problemas'), a:has-text('Try again'), a:has-text('Troubleshoot')"
+                        )
+                        if retry_link:
+                            await retry_link.click()
+                            logger.info("Clicked Turnstile retry link")
+                            await asyncio.sleep(3)
+                    except:
+                        pass
+
+            # If still not solved after 30s, try 2Captcha
+            logger.info("Turnstile not auto-solved, trying 2Captcha...")
             token = await self.turnstile.solve(page)
             if token:
                 logger.info("Turnstile solved via 2Captcha")

@@ -127,6 +127,7 @@ class SlotMonitor:
                     success, message = await self.booking.start_new_booking()
                     if not success:
                         logger.warning(f"Failed to start booking: {message}")
+                        # Re-login and retry start_new_booking
                         success, msg = await self.login.login()
                         if not success:
                             if "ACCOUNT_LOCKED" in msg:
@@ -136,6 +137,13 @@ class SlotMonitor:
                                 await asyncio.sleep(7200)
                             else:
                                 await asyncio.sleep(interval)
+                            continue
+
+                        # After re-login, retry start_new_booking (don't fall through)
+                        success, message = await self.booking.start_new_booking()
+                        if not success:
+                            logger.warning(f"Still can't start booking after re-login: {message}")
+                            await asyncio.sleep(interval)
                             continue
 
                     # Select center and category

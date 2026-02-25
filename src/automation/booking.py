@@ -54,34 +54,81 @@ class BookingAutomation:
             # Navigate to dashboard if not there
             if "/dashboard" not in page.url:
                 await page.goto(VFSUrls.DASHBOARD, wait_until="domcontentloaded", timeout=30000)
-                await self.browser.random_delay(2000, 3000)
+                await self.browser.random_delay(3000, 5000)
+
+            # Wait for Angular to fully render dashboard content
+            try:
+                await page.wait_for_function(
+                    """() => {
+                        const body = document.body?.innerText || '';
+                        return body.includes('Start New Booking') ||
+                               body.includes('Active application') ||
+                               body.includes('No Application');
+                    }""",
+                    timeout=15000,
+                )
+            except:
+                logger.warning("Dashboard content didn't render in time, proceeding anyway...")
 
             await self._dismiss_cookie_consent(page)
             await self._wait_for_loading(page)
 
-            # Wait for "Start New Booking" button
+            # Wait for "Start New Booking" button - try multiple selectors
+            # The element could be <button>, <a>, <div>, or Angular component
             button = None
-            for selector in [
-                Selectors.NEW_BOOKING_BUTTON,
+            button_selectors = [
                 "button:has-text('Start New Booking')",
                 "a:has-text('Start New Booking')",
-            ]:
+                ":has-text('Start New Booking') >> visible=true",
+                "text=Start New Booking",
+            ]
+
+            for selector in button_selectors:
                 try:
-                    await page.wait_for_selector(selector, timeout=10000)
+                    await page.wait_for_selector(selector, timeout=5000)
                     button = await page.query_selector(selector)
-                    if button:
+                    if button and await button.is_visible():
+                        logger.info(f"Start New Booking found with: {selector}")
                         break
+                    button = None
                 except:
                     continue
 
             if not button:
+                # Last resort: find by JS and click directly
+                clicked = await page.evaluate("""
+                    () => {
+                        const els = document.querySelectorAll('button, a, [role="button"]');
+                        for (const el of els) {
+                            if (el.innerText && el.innerText.trim().includes('Start New Booking')) {
+                                el.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                """)
+                if clicked:
+                    logger.info("Start New Booking clicked via JS fallback")
+                    await self.browser.random_delay(2000, 3000)
+                    try:
+                        await page.wait_for_function(
+                            "() => window.location.href.includes('/application-detail')",
+                            timeout=15000,
+                        )
+                    except:
+                        pass
+                    await self._wait_for_loading(page)
+                    await self._dismiss_cookie_consent(page)
+                    logger.info(f"New booking started (URL: {page.url})")
+                    await self.browser.screenshot("booking_page_loaded")
+                    return True, "New booking started"
+
                 await self.browser.screenshot("no_booking_button")
                 return False, "Start New Booking button not found"
 
             await self.browser.screenshot("dashboard_before_booking")
-            await self.browser.human_click(
-                Selectors.NEW_BOOKING_BUTTON if await page.query_selector(Selectors.NEW_BOOKING_BUTTON) else "button:has-text('Start New Booking')"
-            )
+            await button.click()
             await self.browser.random_delay(2000, 3000)
 
             # Wait for application-detail page
