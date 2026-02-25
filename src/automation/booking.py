@@ -72,85 +72,122 @@ class BookingAutomation:
 
             await self._dismiss_cookie_consent(page)
             await self._wait_for_loading(page)
+            await self.browser.screenshot("dashboard_before_booking")
 
-            # Wait for "Start New Booking" button - try multiple selectors
-            # The element could be <button>, <a>, <div>, or Angular component
-            button = None
-            button_selectors = [
-                "button:has-text('Start New Booking')",
-                "a:has-text('Start New Booking')",
-                ":has-text('Start New Booking') >> visible=true",
-                "text=Start New Booking",
+            # Try multiple click strategies until URL leaves /dashboard
+            click_strategies = [
+                self._click_start_booking_via_selector,
+                self._click_start_booking_via_js,
             ]
 
-            for selector in button_selectors:
+            for strategy in click_strategies:
                 try:
-                    await page.wait_for_selector(selector, timeout=5000)
-                    button = await page.query_selector(selector)
-                    if button and await button.is_visible():
-                        logger.info(f"Start New Booking found with: {selector}")
-                        break
-                    button = None
-                except:
-                    continue
+                    clicked = await strategy(page)
+                    if not clicked:
+                        continue
 
-            if not button:
-                # Last resort: find by JS and click directly
-                clicked = await page.evaluate("""
-                    () => {
-                        const els = document.querySelectorAll('button, a, [role="button"]');
-                        for (const el of els) {
-                            if (el.innerText && el.innerText.trim().includes('Start New Booking')) {
-                                el.click();
-                                return true;
-                            }
-                        }
-                        return false;
-                    }
-                """)
-                if clicked:
-                    logger.info("Start New Booking clicked via JS fallback")
-                    await self.browser.random_delay(2000, 3000)
+                    # Wait for navigation away from dashboard
                     try:
                         await page.wait_for_function(
-                            "() => window.location.href.includes('/application-detail')",
-                            timeout=15000,
+                            """() => !window.location.href.includes('/dashboard')""",
+                            timeout=10000,
                         )
                     except:
                         pass
-                    await self._wait_for_loading(page)
-                    await self._dismiss_cookie_consent(page)
-                    logger.info(f"New booking started (URL: {page.url})")
-                    await self.browser.screenshot("booking_page_loaded")
-                    return True, "New booking started"
 
-                await self.browser.screenshot("no_booking_button")
-                return False, "Start New Booking button not found"
+                    await self.browser.random_delay(1000, 2000)
 
-            await self.browser.screenshot("dashboard_before_booking")
-            await button.click()
-            await self.browser.random_delay(2000, 3000)
+                    # Verify we actually left the dashboard
+                    if "/dashboard" not in page.url:
+                        await self._wait_for_loading(page)
+                        await self._dismiss_cookie_consent(page)
+                        logger.info(f"New booking started (URL: {page.url})")
+                        await self.browser.screenshot("booking_page_loaded")
+                        return True, "New booking started"
 
-            # Wait for application-detail page
-            try:
-                await page.wait_for_function(
-                    "() => window.location.href.includes('/application-detail')",
-                    timeout=15000,
-                )
-            except:
-                pass
+                    logger.warning(f"Click didn't navigate (still on {page.url}), trying next strategy...")
+                except Exception as e:
+                    logger.warning(f"Click strategy failed: {e}")
 
-            await self._wait_for_loading(page)
-            await self._dismiss_cookie_consent(page)
-
-            logger.info(f"New booking started (URL: {page.url})")
-            await self.browser.screenshot("booking_page_loaded")
-            return True, "New booking started"
+            await self.browser.screenshot("no_booking_button")
+            return False, "Start New Booking button not found or click didn't navigate"
 
         except Exception as e:
             logger.error(f"Failed to start booking: {e}")
             await self.browser.screenshot("start_booking_error")
             return False, f"Failed to start booking: {str(e)}"
+
+    async def _click_start_booking_via_selector(self, page: Page) -> bool:
+        """Try to click Start New Booking using Playwright selectors"""
+        # Try specific selectors first (button/a), then broader ones
+        selectors = [
+            "button:has-text('Start New Booking')",
+            "a:has-text('Start New Booking')",
+        ]
+
+        for selector in selectors:
+            try:
+                el = await page.wait_for_selector(selector, timeout=5000)
+                if el and await el.is_visible():
+                    logger.info(f"Clicking Start New Booking via: {selector}")
+                    await el.click()
+                    return True
+            except:
+                continue
+
+        return False
+
+    async def _click_start_booking_via_js(self, page: Page) -> bool:
+        """Find and click Start New Booking via JavaScript DOM traversal"""
+        result = await page.evaluate("""
+            () => {
+                // Search ALL elements for the text, find the most specific (innermost) one
+                const candidates = [];
+                const walker = document.createTreeWalker(
+                    document.body,
+                    NodeFilter.SHOW_ELEMENT,
+                    null
+                );
+
+                let node;
+                while (node = walker.nextNode()) {
+                    const text = node.innerText || node.textContent || '';
+                    if (text.trim() === 'Start New Booking' ||
+                        text.trim() === 'Start New Booking ') {
+                        candidates.push(node);
+                    }
+                }
+
+                if (candidates.length === 0) return { found: false };
+
+                // Pick the most specific (deepest/smallest) element
+                // Sort by: fewest children first, then by tag priority
+                const tagPriority = { 'BUTTON': 0, 'A': 1, 'SPAN': 2, 'DIV': 3 };
+                candidates.sort((a, b) => {
+                    const aPri = tagPriority[a.tagName] ?? 5;
+                    const bPri = tagPriority[b.tagName] ?? 5;
+                    if (aPri !== bPri) return aPri - bPri;
+                    return a.children.length - b.children.length;
+                });
+
+                const target = candidates[0];
+                const info = {
+                    found: true,
+                    tag: target.tagName,
+                    text: target.innerText?.trim(),
+                    classes: target.className,
+                };
+
+                target.click();
+                return info;
+            }
+        """)
+
+        if result.get("found"):
+            logger.info(f"JS click: <{result.get('tag')}> class='{result.get('classes', '')}' text='{result.get('text', '')}'")
+            return True
+
+        return False
 
     async def select_center(self, center: str = "Luanda") -> Tuple[bool, str]:
         """Select visa application center"""
