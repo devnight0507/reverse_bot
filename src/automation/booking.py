@@ -298,18 +298,21 @@ class BookingAutomation:
         category: str = "Visto Schengen",
         subcategory: str = "Visto Schengen (Schengen Visa)"
     ) -> Tuple[bool, str]:
-        """Select visa category and subcategory.
+        """Select visa category — subcategory auto-populates after selection.
+
+        VFS has 3 appointment categories: Job Seeker, Visto Nacional, Visto Schengen.
+        After selecting the category, the system processes and the sub-category
+        auto-fills (no manual subcategory selection needed).
 
         Angular Material mat-select dropdowns render mat-option elements
         in a cdk-overlay-container ONLY when the dropdown is open.
-        Must click the mat-select, wait for the overlay panel, then click the option.
         """
         page = self.browser.page
         if not page:
             return False, "Browser not started"
 
         try:
-            logger.info(f"Selecting category: {category} / {subcategory}")
+            logger.info(f"Selecting category: {category}")
 
             # Wait for the form to be fully interactive after page load
             # Angular may still be initializing dropdowns even after they appear in DOM
@@ -327,30 +330,45 @@ class BookingAutomation:
             if not success:
                 return False, f"Failed to select category: {category}"
 
-            await self.browser.random_delay(1000, 2000)
+            # Wait for the system to process — subcategory auto-populates
+            logger.info("Waiting for system to process category selection...")
+            await self.browser.random_delay(2000, 3000)
             await self._wait_for_loading(page)
 
-            # Select subcategory (appears after category is selected)
+            # Check if subcategory was auto-populated
             try:
-                await page.wait_for_selector(Selectors.SUBCATEGORY_SELECT, timeout=15000)
-            except:
-                # Subcategory dropdown may not exist for some categories
-                logger.info("Subcategory dropdown not found, may not be required")
-                return True, f"Category selected: {category} (no subcategory needed)"
-
-            await self.browser.random_delay(1000, 2000)
-
-            success = await self._click_mat_select_and_pick(
-                page, Selectors.SUBCATEGORY_SELECT, subcategory, "subcategory"
-            )
-            if not success:
-                return False, f"Failed to select subcategory: {subcategory}"
+                sub_select = await page.query_selector(Selectors.SUBCATEGORY_SELECT)
+                if sub_select:
+                    sub_value = await page.evaluate("""
+                        () => {
+                            const select = document.querySelector("mat-select[formcontrolname='visaCategoryCode']");
+                            if (!select) return '';
+                            const valueText = select.querySelector('.mat-mdc-select-value-text');
+                            if (valueText) return valueText.innerText.trim();
+                            return '';
+                        }
+                    """)
+                    if sub_value:
+                        logger.info(f"Subcategory auto-populated: {sub_value}")
+                    else:
+                        logger.info("Subcategory dropdown present but empty, attempting to select...")
+                        # Only manually select if it wasn't auto-populated
+                        await self.browser.random_delay(1000, 2000)
+                        pick_success = await self._click_mat_select_and_pick(
+                            page, Selectors.SUBCATEGORY_SELECT, subcategory, "subcategory"
+                        )
+                        if not pick_success:
+                            logger.warning(f"Could not select subcategory: {subcategory}, continuing anyway...")
+                        await self._wait_for_loading(page)
+            except Exception as e:
+                logger.info(f"Subcategory check: {e}")
 
             await self.browser.random_delay(1000, 2000)
             await self._wait_for_loading(page)
+            await self.browser.screenshot("category_selected")
 
-            logger.info(f"Category selected: {category} / {subcategory}")
-            return True, f"Category selected: {category} / {subcategory}"
+            logger.info(f"Category selected: {category}")
+            return True, f"Category selected: {category}"
 
         except Exception as e:
             logger.error(f"Failed to select category: {e}")
