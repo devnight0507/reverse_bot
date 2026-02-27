@@ -101,11 +101,14 @@ class Selectors:
     CENTER_OPTION = "mat-option"
 
     # Booking Form - Category Selection
-    CATEGORY_SELECT = "mat-select[formcontrolname='category']"
-    SUBCATEGORY_SELECT = "mat-select[formcontrolname='subCategory']"
+    # From actual VFS HTML: formcontrolname="selectedSubvisaCategory" (label: "Choose your appointment category")
+    CATEGORY_SELECT = "mat-select[formcontrolname='selectedSubvisaCategory']"
+    # From actual VFS HTML: formcontrolname="visaCategoryCode" (label: "Choose your sub-category")
+    SUBCATEGORY_SELECT = "mat-select[formcontrolname='visaCategoryCode']"
 
     # Booking Form - Payment Mode
-    PAYMENT_MODE_SELECT = "mat-select[formcontrolname='paymentMode'], mat-select[formcontrolname='payment']"
+    # From actual VFS HTML: formcontrolname="paymentMode" (label: "Select the payment mode")
+    PAYMENT_MODE_SELECT = "mat-select[formcontrolname='paymentMode']"
 
     # Booking Form - Applicant Details
     FIRST_NAME = "input[formcontrolname='firstName']"

@@ -86,26 +86,48 @@ class BookingAutomation:
                     if not clicked:
                         continue
 
-                    # Wait for navigation away from dashboard
+                    # Wait for navigation OR form rendering
+                    # Angular SPA may change URL or render form content without URL change
                     try:
                         await page.wait_for_function(
-                            """() => !window.location.href.includes('/dashboard')""",
-                            timeout=10000,
+                            """() => {
+                                // Check if URL changed away from dashboard
+                                if (!window.location.href.includes('/dashboard')) return true;
+                                // Check if appointment form rendered (Angular component loaded)
+                                const body = document.body?.innerText || '';
+                                if (body.includes('Appointment Details')) return true;
+                                if (body.includes('Application Centre')) return true;
+                                if (document.querySelector("mat-select[formcontrolname='centerCode']")) return true;
+                                if (document.querySelector("app-eligibility-criteria")) return true;
+                                return false;
+                            }""",
+                            timeout=15000,
                         )
                     except:
                         pass
 
                     await self.browser.random_delay(1000, 2000)
 
-                    # Verify we actually left the dashboard
-                    if "/dashboard" not in page.url:
+                    # Verify: either URL changed or booking form appeared
+                    url_changed = "/dashboard" not in page.url
+                    form_present = await page.evaluate("""
+                        () => {
+                            const body = document.body?.innerText || '';
+                            return body.includes('Appointment Details') ||
+                                   body.includes('Application Centre') ||
+                                   !!document.querySelector("mat-select[formcontrolname='centerCode']") ||
+                                   !!document.querySelector("app-eligibility-criteria");
+                        }
+                    """)
+
+                    if url_changed or form_present:
                         await self._wait_for_loading(page)
                         await self._dismiss_cookie_consent(page)
-                        logger.info(f"New booking started (URL: {page.url})")
+                        logger.info(f"New booking started (URL: {page.url}, form_present: {form_present})")
                         await self.browser.screenshot("booking_page_loaded")
                         return True, "New booking started"
 
-                    logger.warning(f"Click didn't navigate (still on {page.url}), trying next strategy...")
+                    logger.warning(f"Click didn't navigate or load form (still on {page.url}), trying next strategy...")
                 except Exception as e:
                     logger.warning(f"Click strategy failed: {e}")
 
@@ -209,7 +231,12 @@ class BookingAutomation:
         return False
 
     async def select_center(self, center: str = "Luanda") -> Tuple[bool, str]:
-        """Select visa application center"""
+        """Select visa application center.
+
+        VFS Angola only has 1 center (Luanda) which is auto-selected.
+        The mat-select shows "Portugal Visa Application Center-Luanda"
+        and has class ng-valid when pre-selected.
+        """
         page = self.browser.page
         if not page:
             return False, "Browser not started"
@@ -217,15 +244,38 @@ class BookingAutomation:
         try:
             logger.info(f"Selecting center: {center}")
 
-            await page.wait_for_selector(Selectors.CENTER_SELECT, timeout=15000)
+            # Wait for center dropdown to appear on the form
+            try:
+                await page.wait_for_selector(Selectors.CENTER_SELECT, timeout=15000)
+            except:
+                # If center dropdown not found, check if we're on the right page
+                body_text = await page.text_content("body") or ""
+                if "appointment details" in body_text.lower() or "application centre" in body_text.lower():
+                    logger.info("On appointment details page but center dropdown not found via selector")
+                    await self.browser.screenshot("center_select_debug")
+                    return False, "Center dropdown not found"
+                return False, f"Not on booking form page. URL: {page.url}"
+
             await self.browser.random_delay(500, 1000)
 
-            # Check if already pre-selected
-            current_value = await page.text_content(Selectors.CENTER_SELECT)
-            if current_value and center.lower() in current_value.lower():
-                logger.info(f"Center already selected: {current_value.strip()}")
-                return True, f"Center already selected: {current_value.strip()}"
+            # Check if already pre-selected (VFS Angola has only Luanda)
+            current_value = await page.evaluate("""
+                () => {
+                    const select = document.querySelector("mat-select[formcontrolname='centerCode']");
+                    if (!select) return '';
+                    // Check the displayed value text
+                    const valueText = select.querySelector('.mat-mdc-select-value-text');
+                    if (valueText) return valueText.innerText.trim();
+                    // Fallback: check aria-activedescendant
+                    return select.getAttribute('aria-activedescendant') || '';
+                }
+            """)
 
+            if current_value and center.lower() in current_value.lower():
+                logger.info(f"Center already pre-selected: {current_value}")
+                return True, f"Center already selected: {current_value}"
+
+            # Not pre-selected, click to open dropdown and select
             await self.browser.human_click(Selectors.CENTER_SELECT)
             await self.browser.random_delay(500, 1000)
 
