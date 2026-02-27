@@ -349,6 +349,16 @@ class LoginAutomation:
                     logger.error(f"Browser restart failed: {e}")
                     return False, f"Browser restart failed: {str(e)}"
 
+            # ============================================================
+            # Step 4b: Handle cookie consent FIRST on login page
+            # The consent banner reappears after full page navigation.
+            # Its overlay can block Angular from rendering AND blocks
+            # all clicks on form elements. Must handle BEFORE looking
+            # for the login form.
+            # ============================================================
+            await self._handle_cookie_consent(page)
+            await self._remove_cookie_overlays(page)
+
             await self.browser.screenshot("login_page_loaded")
             logger.info(f"Current URL: {page.url}")
 
@@ -357,25 +367,52 @@ class LoginAutomation:
                 logger.info("Already logged in")
                 return True, "Already logged in"
 
-            # Wait for login form with multiple possible selectors
-            login_selectors = [
-                "input[placeholder*='jane.doe']",  # Seen in screenshots
+            # Wait for login form — use a SINGLE combined selector
+            # instead of 6 sequential selectors × 10s = 60s wasted
+            combined_login_selector = ", ".join([
+                "input[placeholder*='jane.doe']",
                 "input[placeholder*='mail']",
                 Selectors.EMAIL_INPUT,
                 "input[type='email']",
                 "input[formcontrolname='username']",
                 "input[formcontrolname='email']",
-            ]
+            ])
 
             email_input = None
-            for selector in login_selectors:
-                try:
-                    email_input = await page.wait_for_selector(selector, timeout=10000)
-                    if email_input:
-                        logger.info(f"Login form found with selector: {selector}")
-                        break
-                except:
-                    continue
+            try:
+                email_input = await page.wait_for_selector(
+                    combined_login_selector, timeout=30000
+                )
+                if email_input:
+                    logger.info("Login form found")
+            except:
+                pass
+
+            if not email_input:
+                # Page might still be loading — try removing overlays and wait more
+                await self._remove_cookie_overlays(page)
+                logger.info("Login form not found on first try, waiting for page to finish loading...")
+
+                # Check if we're in a Cloudflare waiting room (spinner with no form)
+                is_loading = await page.evaluate("""
+                    () => {
+                        const body = document.body?.innerText?.trim() || '';
+                        const hasSpinner = !!document.querySelector('.mat-progress-spinner, .mat-spinner, .loader');
+                        const isEmpty = body.length < 50;
+                        return { hasSpinner, isEmpty, bodyLen: body.length };
+                    }
+                """)
+                logger.info(f"Page state: {is_loading}")
+
+                # Wait additional time if page seems to be loading
+                if is_loading.get("hasSpinner") or is_loading.get("isEmpty"):
+                    logger.info("Page still loading (spinner detected), waiting up to 30 more seconds...")
+                    try:
+                        email_input = await page.wait_for_selector(
+                            combined_login_selector, timeout=30000
+                        )
+                    except:
+                        pass
 
             if not email_input:
                 await self.browser.screenshot("login_form_not_found")
@@ -383,12 +420,7 @@ class LoginAutomation:
                 logger.error(f"Login form not found. URL: {page.url}, Title: {title}")
                 return False, f"Login form not found. URL: {page.url}"
 
-            # ============================================================
-            # Step 4b: Handle cookie consent on login page
-            # The consent banner reappears after full page navigation
-            # and its overlay blocks all clicks on form elements
-            # ============================================================
-            await self._handle_cookie_consent(page)
+            # Remove any remaining overlays before interacting with form
             await self._remove_cookie_overlays(page)
 
             # ============================================================

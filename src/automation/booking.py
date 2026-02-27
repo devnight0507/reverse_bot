@@ -298,7 +298,12 @@ class BookingAutomation:
         category: str = "Visto Schengen",
         subcategory: str = "Visto Schengen (Schengen Visa)"
     ) -> Tuple[bool, str]:
-        """Select visa category and subcategory"""
+        """Select visa category and subcategory.
+
+        Angular Material mat-select dropdowns render mat-option elements
+        in a cdk-overlay-container ONLY when the dropdown is open.
+        Must click the mat-select, wait for the overlay panel, then click the option.
+        """
         page = self.browser.page
         if not page:
             return False, "Browser not started"
@@ -306,32 +311,42 @@ class BookingAutomation:
         try:
             logger.info(f"Selecting category: {category} / {subcategory}")
 
+            # Wait for the form to be fully interactive after page load
+            # Angular may still be initializing dropdowns even after they appear in DOM
+            await self._wait_for_loading(page)
+            await self.browser.random_delay(2000, 3000)
+
             # Select main category
-            await page.wait_for_selector(Selectors.CATEGORY_SELECT, timeout=10000)
+            await page.wait_for_selector(Selectors.CATEGORY_SELECT, timeout=15000)
             await self.browser.random_delay(500, 1000)
 
-            await self.browser.human_click(Selectors.CATEGORY_SELECT)
-            await self.browser.random_delay(500, 1000)
+            # Click category dropdown and verify it opened
+            success = await self._click_mat_select_and_pick(
+                page, Selectors.CATEGORY_SELECT, category, "category"
+            )
+            if not success:
+                return False, f"Failed to select category: {category}"
 
-            category_option = f"mat-option:has-text('{category}')"
-            await page.wait_for_selector(category_option, timeout=5000)
-            await self.browser.human_click(category_option)
             await self.browser.random_delay(1000, 2000)
-
             await self._wait_for_loading(page)
 
-            # Select subcategory
-            await page.wait_for_selector(Selectors.SUBCATEGORY_SELECT, timeout=10000)
-            await self.browser.random_delay(500, 1000)
+            # Select subcategory (appears after category is selected)
+            try:
+                await page.wait_for_selector(Selectors.SUBCATEGORY_SELECT, timeout=15000)
+            except:
+                # Subcategory dropdown may not exist for some categories
+                logger.info("Subcategory dropdown not found, may not be required")
+                return True, f"Category selected: {category} (no subcategory needed)"
 
-            await self.browser.human_click(Selectors.SUBCATEGORY_SELECT)
-            await self.browser.random_delay(500, 1000)
-
-            subcategory_option = f"mat-option:has-text('{subcategory}')"
-            await page.wait_for_selector(subcategory_option, timeout=5000)
-            await self.browser.human_click(subcategory_option)
             await self.browser.random_delay(1000, 2000)
 
+            success = await self._click_mat_select_and_pick(
+                page, Selectors.SUBCATEGORY_SELECT, subcategory, "subcategory"
+            )
+            if not success:
+                return False, f"Failed to select subcategory: {subcategory}"
+
+            await self.browser.random_delay(1000, 2000)
             await self._wait_for_loading(page)
 
             logger.info(f"Category selected: {category} / {subcategory}")
@@ -341,6 +356,103 @@ class BookingAutomation:
             logger.error(f"Failed to select category: {e}")
             await self.browser.screenshot("select_category_error")
             return False, f"Failed to select category: {str(e)}"
+
+    async def _click_mat_select_and_pick(
+        self, page: Page, select_selector: str, option_text: str, label: str
+    ) -> bool:
+        """Click a mat-select dropdown and pick an option by text.
+
+        Angular Material renders mat-option elements inside a
+        cdk-overlay-container panel that only exists while the dropdown is open.
+        This method:
+        1. Clicks the mat-select to open it
+        2. Waits for the overlay panel with mat-option elements
+        3. Clicks the matching option
+        4. Retries with JS fallback if Playwright click doesn't open the dropdown
+        """
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                logger.info(f"Opening {label} dropdown (attempt {attempt}/{max_attempts})...")
+
+                # Click to open dropdown
+                if attempt <= 2:
+                    await self.browser.human_click(select_selector)
+                else:
+                    # JS fallback: dispatch click event directly
+                    await page.evaluate(f"""
+                        () => {{
+                            const el = document.querySelector("{select_selector}");
+                            if (el) {{
+                                el.click();
+                                el.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}));
+                                el.dispatchEvent(new MouseEvent('mouseup', {{bubbles: true}}));
+                            }}
+                        }}
+                    """)
+
+                await self.browser.random_delay(500, 1000)
+
+                # Wait for overlay panel with options (Angular Material creates this on open)
+                overlay_selector = ".cdk-overlay-container mat-option, .mat-mdc-select-panel mat-option"
+                try:
+                    await page.wait_for_selector(overlay_selector, timeout=5000)
+                    logger.info(f"{label} dropdown panel opened")
+                except:
+                    logger.warning(f"{label} dropdown didn't open on attempt {attempt}")
+                    # Close any partial state and retry
+                    await page.keyboard.press("Escape")
+                    await self.browser.random_delay(1000, 2000)
+                    continue
+
+                # Find and click the matching option
+                option_selector = f"mat-option:has-text('{option_text}')"
+                try:
+                    option = await page.wait_for_selector(option_selector, timeout=5000)
+                    if option:
+                        await option.click()
+                        logger.info(f"{label} option selected: {option_text}")
+                        return True
+                except:
+                    pass
+
+                # Fallback: try JS click on the option
+                clicked = await page.evaluate(f"""
+                    () => {{
+                        const options = document.querySelectorAll('mat-option');
+                        for (const opt of options) {{
+                            const text = opt.textContent?.trim() || '';
+                            if (text.includes('{option_text}')) {{
+                                opt.click();
+                                return true;
+                            }}
+                        }}
+                        return false;
+                    }}
+                """)
+                if clicked:
+                    logger.info(f"{label} option selected via JS: {option_text}")
+                    return True
+
+                # Log available options for debugging
+                available = await page.evaluate("""
+                    () => {
+                        const options = document.querySelectorAll('mat-option');
+                        return Array.from(options).map(o => o.textContent?.trim()).filter(Boolean);
+                    }
+                """)
+                logger.warning(f"Available {label} options: {available}")
+
+                # Close dropdown before retry
+                await page.keyboard.press("Escape")
+                await self.browser.random_delay(1000, 2000)
+
+            except Exception as e:
+                logger.warning(f"{label} dropdown attempt {attempt} error: {e}")
+                await self.browser.random_delay(1000, 2000)
+
+        await self.browser.screenshot(f"select_{label}_failed")
+        return False
 
     async def select_payment_mode(self, mode: str = "Multicaixa") -> Tuple[bool, str]:
         """Select payment mode dropdown"""
@@ -353,21 +465,20 @@ class BookingAutomation:
 
             # Wait for payment mode dropdown to appear
             try:
-                await page.wait_for_selector(Selectors.PAYMENT_MODE_SELECT, timeout=10000)
+                await page.wait_for_selector(Selectors.PAYMENT_MODE_SELECT, timeout=15000)
             except:
                 logger.info("Payment mode dropdown not found, may not be required")
                 return True, "Payment mode not required"
 
-            await self.browser.random_delay(500, 1000)
-            await self.browser.human_click(Selectors.PAYMENT_MODE_SELECT)
-            await self.browser.random_delay(500, 1000)
-
-            # Select Multicaixa option
-            option_selector = f"mat-option:has-text('{mode}')"
-            await page.wait_for_selector(option_selector, timeout=5000)
-            await self.browser.human_click(option_selector)
             await self.browser.random_delay(1000, 2000)
 
+            success = await self._click_mat_select_and_pick(
+                page, Selectors.PAYMENT_MODE_SELECT, mode, "payment_mode"
+            )
+            if not success:
+                return False, f"Failed to select payment mode: {mode}"
+
+            await self.browser.random_delay(1000, 2000)
             await self._wait_for_loading(page)
             logger.info(f"Payment mode selected: {mode}")
             return True, f"Payment mode selected: {mode}"
