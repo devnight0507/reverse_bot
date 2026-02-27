@@ -118,16 +118,28 @@ class BookingAutomation:
             return False, f"Failed to start booking: {str(e)}"
 
     async def _click_start_booking_via_selector(self, page: Page) -> bool:
-        """Try to click Start New Booking using Playwright selectors"""
-        # Try specific selectors first (button/a), then broader ones
+        """Try to click Start New Booking using Playwright selectors.
+
+        VFS dashboard has TWO "Start New Booking" buttons:
+        1. Mobile: <button class="... d-lg-none ...">  (hidden on desktop via d-lg-none)
+        2. Desktop: <button class="... d-none d-lg-inline-block ...">  (hidden on mobile)
+        Both are <button mat-raised-button class="btn btn-brand-orange ...">
+        Text is inside: <span class="mdc-button__label"> Start New Booking </span>
+        """
         selectors = [
-            "button:has-text('Start New Booking')",
-            "a:has-text('Start New Booking')",
+            # Desktop button (d-lg-inline-block) — visible at >= 992px width
+            "button.btn-brand-orange.d-lg-inline-block",
+            # Mobile button (d-lg-none) — visible at < 992px width
+            "button.btn-brand-orange.d-lg-none",
+            # Any btn-brand-orange button (in case classes change)
+            "button.btn-brand-orange",
+            # Fallback: Angular Material button with text
+            "button.mat-mdc-raised-button:has-text('Start New Booking')",
         ]
 
         for selector in selectors:
             try:
-                el = await page.wait_for_selector(selector, timeout=5000)
+                el = await page.query_selector(selector)
                 if el and await el.is_visible():
                     logger.info(f"Clicking Start New Booking via: {selector}")
                     await el.click()
@@ -138,53 +150,60 @@ class BookingAutomation:
         return False
 
     async def _click_start_booking_via_js(self, page: Page) -> bool:
-        """Find and click Start New Booking via JavaScript DOM traversal"""
+        """Find and click Start New Booking via JavaScript.
+
+        Finds the visible btn-brand-orange button and dispatches a click event.
+        This bypasses any Playwright selector issues with Angular Material buttons.
+        """
         result = await page.evaluate("""
             () => {
-                // Search ALL elements for the text, find the most specific (innermost) one
-                const candidates = [];
-                const walker = document.createTreeWalker(
-                    document.body,
-                    NodeFilter.SHOW_ELEMENT,
-                    null
-                );
-
-                let node;
-                while (node = walker.nextNode()) {
-                    const text = node.innerText || node.textContent || '';
-                    if (text.trim() === 'Start New Booking' ||
-                        text.trim() === 'Start New Booking ') {
-                        candidates.push(node);
+                // Strategy 1: Find by class (most reliable based on VFS HTML)
+                const brandButtons = document.querySelectorAll('button.btn-brand-orange');
+                for (const btn of brandButtons) {
+                    const style = window.getComputedStyle(btn);
+                    if (style.display !== 'none' && style.visibility !== 'hidden') {
+                        btn.click();
+                        return {
+                            found: true, strategy: 'btn-brand-orange',
+                            tag: btn.tagName, classes: btn.className.substring(0, 80),
+                            display: style.display,
+                        };
                     }
                 }
 
-                if (candidates.length === 0) return { found: false };
+                // Strategy 2: Find by mdc-button__label text
+                const labels = document.querySelectorAll('.mdc-button__label');
+                for (const label of labels) {
+                    if (label.textContent.trim() === 'Start New Booking') {
+                        const btn = label.closest('button');
+                        if (btn) {
+                            btn.click();
+                            return {
+                                found: true, strategy: 'mdc-button__label',
+                                tag: btn.tagName, classes: btn.className.substring(0, 80),
+                            };
+                        }
+                    }
+                }
 
-                // Pick the most specific (deepest/smallest) element
-                // Sort by: fewest children first, then by tag priority
-                const tagPriority = { 'BUTTON': 0, 'A': 1, 'SPAN': 2, 'DIV': 3 };
-                candidates.sort((a, b) => {
-                    const aPri = tagPriority[a.tagName] ?? 5;
-                    const bPri = tagPriority[b.tagName] ?? 5;
-                    if (aPri !== bPri) return aPri - bPri;
-                    return a.children.length - b.children.length;
-                });
+                // Strategy 3: Brute force - any element with the text
+                const allButtons = document.querySelectorAll('button, a, [role="button"]');
+                for (const el of allButtons) {
+                    if (el.innerText && el.innerText.trim().includes('Start New Booking')) {
+                        el.click();
+                        return {
+                            found: true, strategy: 'text-search',
+                            tag: el.tagName, classes: el.className.substring(0, 80),
+                        };
+                    }
+                }
 
-                const target = candidates[0];
-                const info = {
-                    found: true,
-                    tag: target.tagName,
-                    text: target.innerText?.trim(),
-                    classes: target.className,
-                };
-
-                target.click();
-                return info;
+                return { found: false };
             }
         """)
 
         if result.get("found"):
-            logger.info(f"JS click: <{result.get('tag')}> class='{result.get('classes', '')}' text='{result.get('text', '')}'")
+            logger.info(f"JS click ({result.get('strategy')}): <{result.get('tag')}> class='{result.get('classes', '')}' display={result.get('display', 'n/a')}")
             return True
 
         return False
