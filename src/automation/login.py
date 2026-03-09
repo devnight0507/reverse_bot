@@ -722,6 +722,9 @@ class LoginAutomation:
 
                 await self.browser.screenshot("otp_entered")
 
+                # Track this OTP as used so we don't reuse it on retry
+                self._last_used_otp = otp_code
+
                 # Turnstile appears on OTP page too - wait and solve it
                 logger.info("Checking for Turnstile on OTP page...")
                 await self._wait_and_solve_turnstile(page, timeout=15)
@@ -750,6 +753,27 @@ class LoginAutomation:
                 await self.browser.random_delay(3000, 5000)
                 await self.browser.screenshot("after_otp_submit")
 
+                # Check for OTP error (invalid/expired code)
+                error_text = await page.evaluate("""
+                    () => {
+                        const errors = document.querySelectorAll('.alert-danger, .error-message, .mat-error, [class*="error"]');
+                        for (const el of errors) {
+                            const text = el.textContent?.trim();
+                            if (text && text.length > 5) return text;
+                        }
+                        // Also check if still on OTP page (Sign In failed)
+                        const body = document.body?.innerText || '';
+                        if (body.includes('Invalid') || body.includes('invalid')) return 'Invalid OTP code';
+                        if (body.includes('expired') || body.includes('Expired')) return 'OTP expired';
+                        return '';
+                    }
+                """)
+
+                if error_text:
+                    logger.warning(f"OTP error detected: {error_text}")
+                    await self.browser.screenshot("otp_error")
+                    return False, f"OTP failed: {error_text}"
+
                 return True, "OTP submitted"
             else:
                 return False, "OTP input field not found"
@@ -758,7 +782,12 @@ class LoginAutomation:
             return False, f"OTP entry error: {str(e)}"
 
     async def _read_otp_from_email(self) -> Optional[str]:
-        """Try to read OTP code from email via IMAP"""
+        """Try to read OTP code from email via IMAP.
+
+        Tracks the last used OTP to avoid reusing a stale code from a previous
+        login attempt. IMAP SINCE filter uses date-only (not time), so emails
+        from earlier today still appear.
+        """
         if not settings.smtp_user or not settings.smtp_password:
             logger.info("Email not configured, skipping auto OTP read")
             return None
@@ -767,6 +796,7 @@ class LoginAutomation:
             import imaplib
             import email as email_lib
             from datetime import datetime, timedelta
+            from email.utils import parsedate_to_datetime
 
             logger.info("Checking email for OTP code...")
 
@@ -774,11 +804,10 @@ class LoginAutomation:
             imap.login(settings.smtp_user, settings.smtp_password)
             imap.select("INBOX")
 
-            # Search for recent VFS emails (last 5 minutes)
+            # Search for recent VFS emails (SINCE uses date only, not time)
             date_str = (datetime.now() - timedelta(minutes=5)).strftime("%d-%b-%Y")
 
             # VFS sends OTP from info@vfshelpline.com (display name "VFS Global")
-            # Try multiple search terms to match
             message_ids_list = []
             for search_from in ["vfshelpline", "vfs"]:
                 _, message_ids = imap.search(None, f'(SINCE "{date_str}" FROM "{search_from}")')
@@ -802,8 +831,25 @@ class LoginAutomation:
             # Get the latest email
             latest_id = message_ids_list[-1]
             _, msg_data = imap.fetch(latest_id, "(RFC822)")
-
             msg = email_lib.message_from_bytes(msg_data[0][1])
+
+            # Check email timestamp — reject if older than 3 minutes
+            email_date = None
+            date_header = msg.get("Date")
+            if date_header:
+                try:
+                    email_date = parsedate_to_datetime(date_header)
+                    # Make timezone-naive for comparison
+                    if email_date.tzinfo:
+                        email_date = email_date.replace(tzinfo=None)
+                    age_seconds = (datetime.utcnow() - email_date).total_seconds()
+                    logger.info(f"Latest VFS email age: {age_seconds:.0f}s (Date: {date_header})")
+                    if age_seconds > 180:  # 3 minutes
+                        logger.info(f"Email is too old ({age_seconds:.0f}s > 180s), likely stale OTP")
+                        imap.logout()
+                        return None
+                except Exception as e:
+                    logger.warning(f"Could not parse email date '{date_header}': {e}")
 
             # Extract body
             body = ""
@@ -823,6 +869,10 @@ class LoginAutomation:
             otp_match = re.search(r'\b(\d{6})\b', body)
             if otp_match:
                 otp = otp_match.group(1)
+                # Check against last used OTP to avoid reuse
+                if hasattr(self, '_last_used_otp') and otp == self._last_used_otp:
+                    logger.info(f"OTP {otp[:2]}**** already used, skipping")
+                    return None
                 logger.info(f"OTP code found in email: {otp[:2]}****")
                 return otp
 
@@ -830,6 +880,9 @@ class LoginAutomation:
             otp_match = re.search(r'\b(\d{4})\b', body)
             if otp_match:
                 otp = otp_match.group(1)
+                if hasattr(self, '_last_used_otp') and otp == self._last_used_otp:
+                    logger.info(f"OTP {otp[:2]}** already used, skipping")
+                    return None
                 logger.info(f"OTP code found in email: {otp[:2]}**")
                 return otp
 
