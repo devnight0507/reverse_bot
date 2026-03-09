@@ -22,6 +22,9 @@ class ApplicantBase(BaseModel):
     gender: str = Field(default="Male", pattern="^(Male|Female)$")
     visa_type: str = Field(default="TOURIST", max_length=50)
     priority: int = Field(default=0, ge=0, le=100)
+    face_photo_path: Optional[str] = None
+    passport_front_path: Optional[str] = None
+    passport_page_path: Optional[str] = None
     notes: Optional[str] = None
 
 
@@ -45,6 +48,9 @@ class ApplicantUpdate(BaseModel):
     visa_type: Optional[str] = Field(None, max_length=50)
     priority: Optional[int] = Field(None, ge=0, le=100)
     status: Optional[str] = None
+    face_photo_path: Optional[str] = None
+    passport_front_path: Optional[str] = None
+    passport_page_path: Optional[str] = None
     notes: Optional[str] = None
 
 

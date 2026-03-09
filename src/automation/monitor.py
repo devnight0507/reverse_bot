@@ -208,8 +208,8 @@ class SlotMonitor:
                                 await self.booking.handle_reminder_modal()
                                 await self.booking.handle_service_fee_notice()
 
-                                # Identity verification
-                                success, msg = await self.booking.handle_identity_verification()
+                                # Identity verification (pass applicant for uploaded photos)
+                                success, msg = await self.booking.handle_identity_verification(applicant)
                                 if not success:
                                     logger.warning(f"Verification failed: {msg}")
                                     continue

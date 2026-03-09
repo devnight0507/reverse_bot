@@ -770,13 +770,68 @@ class BookingAutomation:
     # Phase 7: Identity Verification (delegated)
     # ================================================================
 
-    async def handle_identity_verification(self) -> Tuple[bool, str]:
+    async def _inject_fake_camera(self, page, image_path: str) -> bool:
+        """Override getUserMedia to serve a static image as fake camera feed.
+        This converts the image to a canvas stream that the verification page sees as a webcam.
+        """
+        import base64
+        from pathlib import Path
+
+        img_path = Path(image_path)
+        if not img_path.exists():
+            logger.warning(f"Image not found for fake camera: {image_path}")
+            return False
+
+        with open(img_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+
+        ext = img_path.suffix.lower()
+        mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
+
+        js = f"""
+        (function() {{
+            const dataUrl = 'data:{mime};base64,{b64}';
+            const img = new Image();
+            img.src = dataUrl;
+            img.onload = function() {{
+                const canvas = document.createElement('canvas');
+                canvas.width = img.width;
+                canvas.height = img.height;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0);
+
+                const stream = canvas.captureStream(30);
+                const origGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+
+                navigator.mediaDevices.getUserMedia = function(constraints) {{
+                    if (constraints && constraints.video) {{
+                        return Promise.resolve(stream);
+                    }}
+                    return origGetUserMedia(constraints);
+                }};
+
+                // Also keep redrawing to keep the stream alive
+                setInterval(() => {{ ctx.drawImage(img, 0, 0); }}, 100);
+            }};
+            window.__fakeCameraActive = true;
+        }})();
+        """
+        try:
+            await page.evaluate(js)
+            logger.info(f"Injected fake camera with image: {img_path.name}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to inject fake camera: {e}")
+            return False
+
+    async def handle_identity_verification(self, applicant: Optional[Dict] = None) -> Tuple[bool, str]:
         """Handle identity verification - detect and wait for completion
 
         Identity verification happens on idnvui.vfsglobal.com and requires
         a camera (face liveness + passport scan). The bot can either:
-        1. Use pre-recorded video via Chrome fake video flags
-        2. Pause and wait for human to complete manually
+        1. Inject uploaded photos as fake camera via JS getUserMedia override
+        2. Use Chrome --use-fake-device-for-media-stream flag (set at launch)
+        3. Pause and wait for human to complete manually
         """
         page = self.browser.page
         if not page:
@@ -791,19 +846,31 @@ class BookingAutomation:
                 logger.info("Identity verification page detected!")
                 await self.browser.screenshot("identity_verification_start")
 
+                # Check if applicant has uploaded photos
+                face_photo = applicant.get("face_photo_path") if applicant else None
+                passport_front = applicant.get("passport_front_path") if applicant else None
+                passport_page = applicant.get("passport_page_path") if applicant else None
+                has_photos = face_photo or passport_front or passport_page
+
+                if has_photos:
+                    logger.info("Applicant has uploaded ID photos - will attempt auto-verification")
+                else:
+                    logger.info("No uploaded photos - waiting for manual verification")
+
                 # Notify via callback (Telegram)
                 if self._on_verification_needed:
                     try:
+                        msg = ("Identity verification started. "
+                               + ("Using uploaded photos for auto-verification." if has_photos
+                                  else "Please complete face + passport verification on the computer."))
                         if asyncio.iscoroutinefunction(self._on_verification_needed):
-                            await self._on_verification_needed("verification_needed",
-                                "Identity verification required. Please complete face + passport verification on the computer.")
+                            await self._on_verification_needed("verification_needed", msg)
                         else:
-                            self._on_verification_needed("verification_needed",
-                                "Identity verification required. Please complete face + passport verification on the computer.")
+                            self._on_verification_needed("verification_needed", msg)
                     except Exception as e:
                         logger.error(f"Verification callback error: {e}")
 
-                # Try to click Continue on the start page
+                # Step 1: Click Continue on the start page (health & safety advisory)
                 try:
                     continue_btn = await page.query_selector("button:has-text('CONTINUE'), button:has-text('Continue')")
                     if continue_btn:
@@ -813,17 +880,93 @@ class BookingAutomation:
                 except:
                     pass
 
-                # Wait for verification to complete (redirect back to VFS)
-                # Human completes face + passport verification manually
-                # Or fake video completes automatically
+                # Step 2: Inject face photo for liveness check
+                if face_photo:
+                    await asyncio.sleep(2)
+                    await self._inject_fake_camera(page, face_photo)
+                    logger.info("Face photo injected as camera feed for liveness check")
+
+                # Wait for face liveness to complete (look for passport step or completion)
+                logger.info("Waiting for face liveness check (up to 2 minutes)...")
+                try:
+                    await page.wait_for_function(
+                        """() => {
+                            const text = document.body?.innerText?.toLowerCase() || '';
+                            return text.includes('photo accepted') ||
+                                   text.includes('passport verification') ||
+                                   text.includes('start passport') ||
+                                   text.includes('security check completed') ||
+                                   window.location.href.includes('visa.vfsglobal.com');
+                        }""",
+                        timeout=120000,
+                    )
+                except:
+                    logger.warning("Face liveness timeout (2 min)")
+                    await self.browser.screenshot("face_liveness_timeout")
+
+                await self.browser.screenshot("after_face_check")
+
+                # Step 3: If we're at passport verification, inject passport photos
+                body_text = await page.text_content("body") or ""
+                if "passport verification" in body_text.lower() or "start passport" in body_text.lower():
+                    logger.info("Passport verification step detected")
+
+                    # Click Continue to start passport capture
+                    try:
+                        continue_btn = await page.query_selector("button:has-text('CONTINUE'), button:has-text('Continue')")
+                        if continue_btn:
+                            await continue_btn.click()
+                            await self.browser.random_delay(2000, 3000)
+                    except:
+                        pass
+
+                    # Inject passport front photo
+                    if passport_front:
+                        await asyncio.sleep(2)
+                        await self._inject_fake_camera(page, passport_front)
+                        logger.info("Passport front photo injected as camera feed")
+
+                    # Wait for passport front to be detected
+                    try:
+                        await page.wait_for_function(
+                            """() => {
+                                const text = document.body?.innerText?.toLowerCase() || '';
+                                return text.includes('passport detected') ||
+                                       text.includes('step 2') ||
+                                       text.includes('photo page');
+                            }""",
+                            timeout=60000,
+                        )
+                    except:
+                        logger.warning("Passport front detection timeout")
+
+                    await self.browser.screenshot("after_passport_front")
+
+                    # Inject passport photo page
+                    if passport_page:
+                        await asyncio.sleep(2)
+                        await self._inject_fake_camera(page, passport_page)
+                        logger.info("Passport photo page injected as camera feed")
+
+                    # Click CAPTURE button if visible (10-second countdown)
+                    try:
+                        capture_btn = await page.query_selector("button:has-text('CAPTURE'), button:has-text('Capture')")
+                        if capture_btn:
+                            await capture_btn.click()
+                            logger.info("Clicked CAPTURE for passport photo page")
+                            await asyncio.sleep(12)  # Wait for 10-second countdown
+                    except:
+                        pass
+
+                    await self.browser.screenshot("after_passport_page")
+
+                # Step 4: Wait for security check to complete
                 logger.info("Waiting for identity verification to complete (up to 5 minutes)...")
                 try:
                     await page.wait_for_function(
                         """() => {
-                            // Check for completion message
                             const text = document.body?.innerText?.toLowerCase() || '';
                             if (text.includes('security check completed')) return true;
-                            // Check if redirected back to VFS
                             if (window.location.href.includes('visa.vfsglobal.com')) return true;
                             return false;
                         }""",
@@ -834,7 +977,7 @@ class BookingAutomation:
                     await self.browser.screenshot("verification_timeout")
                     return False, "Identity verification timeout"
 
-                # If still on idnvui.vfsglobal.com, click Continue to redirect back
+                # Click Continue to redirect back to VFS
                 if "idnvui.vfsglobal.com" in page.url:
                     try:
                         continue_btn = await page.query_selector("button:has-text('CONTINUE'), button:has-text('Continue')")
@@ -1429,8 +1572,8 @@ class BookingAutomation:
         if not success:
             return False, message, None
 
-        # Phase 7: Identity Verification
-        success, message = await self.handle_identity_verification()
+        # Phase 7: Identity Verification (pass applicant for uploaded photos)
+        success, message = await self.handle_identity_verification(applicant)
         if not success:
             return False, message, None
 

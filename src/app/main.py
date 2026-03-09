@@ -3,11 +3,12 @@ FastAPI Application - VFS Booking Bot API
 """
 from contextlib import asynccontextmanager
 from typing import List, Optional
-from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, UploadFile, File
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from pathlib import Path
+import shutil
 from loguru import logger
 
 from .config import settings
@@ -132,6 +133,39 @@ async def delete_applicant(
     deleted = await crud.delete_applicant(db, applicant_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Applicant not found")
+
+
+@app.post("/api/applicants/{applicant_id}/upload/{photo_type}")
+async def upload_photo(
+    applicant_id: int,
+    photo_type: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_session)
+):
+    """Upload face/passport photo for identity verification.
+    photo_type: face_photo, passport_front, passport_page
+    """
+    applicant = await crud.get_applicant(db, applicant_id)
+    if not applicant:
+        raise HTTPException(status_code=404, detail="Applicant not found")
+
+    if photo_type not in ("face_photo", "passport_front", "passport_page"):
+        raise HTTPException(status_code=400, detail="Invalid photo type")
+
+    # Save file
+    uploads_dir = Path("data/uploads") / str(applicant_id)
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    ext = Path(file.filename).suffix or ".jpg"
+    file_path = uploads_dir / f"{photo_type}{ext}"
+    with open(file_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    # Update applicant record
+    update_data = {f"{photo_type}_path": str(file_path)}
+    await crud.update_applicant(db, applicant_id, **update_data)
+
+    return {"message": f"{photo_type} uploaded", "path": str(file_path)}
 
 
 # ============== Booking Routes ==============

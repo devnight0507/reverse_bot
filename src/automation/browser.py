@@ -120,7 +120,18 @@ class BrowserManager:
             "--disable-popup-blocking",
             "--disable-sync",
             "--metrics-recording-only",
+            # Fake camera for identity verification - allows feeding pre-recorded video
+            "--use-fake-device-for-media-stream",
+            "--use-fake-ui-for-media-stream",
         ]
+
+        # If a face photo video exists, use it as fake camera input
+        fake_video = Path("data/uploads/fake_camera.mjpeg")
+        if not fake_video.exists():
+            fake_video = Path("data/uploads/fake_camera.y4m")
+        if fake_video.exists():
+            args.append(f"--use-file-for-fake-video-capture={str(fake_video.resolve())}")
+            logger.info(f"Using fake video for camera: {fake_video}")
 
         if settings.headless:
             args.append("--headless=new")

@@ -1,6 +1,7 @@
 """
 Database connection and session management
 """
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
 from .config import settings
@@ -27,19 +28,23 @@ async def init_db():
     """Initialize database tables"""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Add dial_code column if missing (migration for existing DBs)
-        await conn.execute(
-            __import__('sqlalchemy').text(
-                "ALTER TABLE applicants ADD COLUMN dial_code VARCHAR(10) DEFAULT '+244'"
-            )
-        ) if await _column_missing(conn, "applicants", "dial_code") else None
+        # Add new columns if missing (migration for existing DBs)
+        migrations = [
+            ("dial_code", "VARCHAR(10) DEFAULT '+244'"),
+            ("face_photo_path", "VARCHAR(500)"),
+            ("passport_front_path", "VARCHAR(500)"),
+            ("passport_page_path", "VARCHAR(500)"),
+        ]
+        for col_name, col_type in migrations:
+            if await _column_missing(conn, "applicants", col_name):
+                await conn.execute(text(
+                    f"ALTER TABLE applicants ADD COLUMN {col_name} {col_type}"
+                ))
 
 
 async def _column_missing(conn, table: str, column: str) -> bool:
     """Check if a column is missing from a table (SQLite)"""
-    result = await conn.execute(
-        __import__('sqlalchemy').text(f"PRAGMA table_info({table})")
-    )
+    result = await conn.execute(text(f"PRAGMA table_info({table})"))
     columns = [row[1] for row in result.fetchall()]
     return column not in columns
 
