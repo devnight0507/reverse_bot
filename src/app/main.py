@@ -289,7 +289,10 @@ async def _run_bot(applicant_dicts: list):
         from ..automation.browser import BrowserManager
         from ..automation.monitor import SlotMonitor
     except Exception as e:
-        logger.error(f"Failed to import automation modules: {e}")
+        import traceback
+        error_msg = f"Failed to import automation modules: {e}\n{traceback.format_exc()}"
+        logger.error(error_msg)
+        print(f"\n{'='*60}\n{error_msg}\n{'='*60}\n", flush=True)
         bot_state["is_running"] = False
         bot_state["current_step"] = f"Import error: {e}"
         return
@@ -327,14 +330,17 @@ async def _run_bot(applicant_dicts: list):
             except Exception:
                 pass
 
+        print("[BOT] Starting browser...", flush=True)
         logger.info("Starting browser...")
         bot_state["current_step"] = "Starting browser..."
         page = await _browser.start()
         if not page:
+            print("[BOT] ERROR: Failed to start browser - no page returned", flush=True)
             logger.error("Failed to start browser - no page returned")
             bot_state["is_running"] = False
             bot_state["current_step"] = "Browser failed to start"
             return
+        print("[BOT] Browser started OK", flush=True)
 
         bot_state["current_step"] = "Browser started"
 
@@ -369,13 +375,15 @@ async def _run_bot(applicant_dicts: list):
 
     except asyncio.CancelledError:
         logger.info("Bot task cancelled")
+        bot_state["current_step"] = "Cancelled"
     except Exception as e:
         import traceback
-        logger.error(f"Bot fatal error: {e}\n{traceback.format_exc()}")
-        bot_state["current_step"] = f"Fatal: {str(e)}"
+        error_msg = f"Bot fatal error: {e}\n{traceback.format_exc()}"
+        logger.error(error_msg)
+        print(f"\n{'='*60}\n{error_msg}\n{'='*60}\n", flush=True)
+        bot_state["current_step"] = f"Error: {str(e)[:100]}"
     finally:
         bot_state["is_running"] = False
-        bot_state["current_step"] = None
         bot_state["current_applicant_id"] = None
         if _browser:
             try:
