@@ -3,6 +3,7 @@ FastAPI Application - VFS Booking Bot API
 """
 import asyncio
 import sys
+import threading
 from contextlib import asynccontextmanager
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, UploadFile, File
@@ -12,11 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pathlib import Path
 import shutil
 from loguru import logger
-
-# On Windows, Playwright needs ProactorEventLoop for subprocess support.
-# This must be set before any event loop is created.
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from .config import settings
 from .database import init_db, get_session
@@ -288,7 +284,7 @@ def _applicant_to_dict(a) -> dict:
 
 
 async def _run_bot(applicant_dicts: list):
-    """Background task: run the slot monitor"""
+    """Run the slot monitor (runs in its own event loop thread)"""
     global _browser, _monitor
 
     try:
@@ -354,12 +350,10 @@ async def _run_bot(applicant_dicts: list):
 
         # Determine visa category from first applicant
         visa_type = applicant_dicts[0].get("visa_type", "Visto Schengen") if applicant_dicts else "Visto Schengen"
-        # Map visa_type to category/subcategory
         category_map = {
             "Visto Schengen": ("Visto Schengen", "Visto Schengen (Schengen Visa)"),
             "Visto Nacional": ("Visto Nacional", "Visto Nacional (National visa)"),
             "Job Seeker": ("Job Seeker", "Job seekers"),
-            # Legacy/fallback mappings
             "TOURIST": ("Visto Schengen", "Visto Schengen (Schengen Visa)"),
             "BUSINESS": ("Visto Schengen", "Visto Schengen (Schengen Visa)"),
             "STUDENT": ("Visto Nacional", "Visto Nacional (National visa)"),
@@ -401,8 +395,26 @@ async def _run_bot(applicant_dicts: list):
         logger.info("Bot stopped")
 
 
-# Keep reference to the background task so we can cancel it
-_bot_task = None
+def _run_bot_thread(applicant_dicts: list):
+    """Run the bot in a separate thread with its own ProactorEventLoop.
+
+    On Windows, uvicorn's event loop (SelectorEventLoop) doesn't support
+    subprocess creation, which Playwright needs. This thread creates a
+    ProactorEventLoop that supports it.
+    """
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_run_bot(applicant_dicts))
+    finally:
+        loop.close()
+
+
+# Keep reference to the background thread
+_bot_thread = None
 
 
 @app.get("/api/bot/status", response_model=schemas.BotStatusResponse)
@@ -423,7 +435,7 @@ async def start_bot(
     db: AsyncSession = Depends(get_session)
 ):
     """Start the booking bot for specified applicants"""
-    global _bot_task
+    global _bot_thread
 
     if bot_state["is_running"]:
         raise HTTPException(status_code=400, detail="Bot is already running")
@@ -451,8 +463,9 @@ async def start_bot(
     bot_state["total_success"] = 0
     bot_state["total_failed"] = 0
 
-    # Launch bot as background asyncio task
-    _bot_task = asyncio.create_task(_run_bot(applicants))
+    # Launch bot in a separate thread with its own event loop (Windows fix)
+    _bot_thread = threading.Thread(target=_run_bot_thread, args=(applicants,), daemon=True)
+    _bot_thread.start()
 
     names = ", ".join(a["first_name"] for a in applicants)
     return {"message": f"Bot started for: {names}", "status": "running"}
@@ -461,26 +474,15 @@ async def start_bot(
 @app.post("/api/bot/stop")
 async def stop_bot():
     """Stop the booking bot"""
-    global _bot_task
-
     if not bot_state["is_running"]:
         raise HTTPException(status_code=400, detail="Bot is not running")
 
-    # Stop the monitor gracefully
+    # Stop the monitor gracefully (just sets _running = False)
     if _monitor:
-        await _monitor.stop()
-
-    # Cancel the background task if still running
-    if _bot_task and not _bot_task.done():
-        _bot_task.cancel()
-        try:
-            await _bot_task
-        except asyncio.CancelledError:
-            pass
-    _bot_task = None
+        _monitor._running = False
 
     bot_state["is_running"] = False
-    bot_state["current_step"] = None
+    bot_state["current_step"] = "Stopping..."
 
     return {"message": "Bot stopped", "status": "stopped"}
 
