@@ -64,6 +64,11 @@
                         <h2 class="text-sm font-medium text-slate-500">Checks</h2>
                         <p id="checkCount" class="text-sm text-slate-600 mt-1">0</p>
                     </div>
+                    <div class="hidden sm:block w-px h-10 bg-slate-200"></div>
+                    <div>
+                        <h2 class="text-sm font-medium text-slate-500">Step</h2>
+                        <p id="currentStep" class="text-sm text-slate-600 mt-1">-</p>
+                    </div>
                 </div>
                 <button id="btnStop" onclick="stopBot()" disabled
                     class="inline-flex items-center gap-2 px-5 py-2.5 bg-red-600 hover:bg-red-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white text-sm font-medium rounded-lg transition-colors">
@@ -379,6 +384,7 @@
 
                 document.getElementById('lastCheck').textContent = s.last_check ? new Date(s.last_check).toLocaleTimeString() : 'Never';
                 document.getElementById('checkCount').textContent = s.total_processed || 0;
+                document.getElementById('currentStep').textContent = s.current_step || '-';
             } catch (e) { console.error(e); }
         }
 

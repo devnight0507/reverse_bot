@@ -1,6 +1,7 @@
 """
 FastAPI Application - VFS Booking Bot API
 """
+import asyncio
 from contextlib import asynccontextmanager
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, UploadFile, File
@@ -283,8 +284,15 @@ def _applicant_to_dict(a) -> dict:
 async def _run_bot(applicant_dicts: list):
     """Background task: run the slot monitor"""
     global _browser, _monitor
-    from ..automation.browser import BrowserManager
-    from ..automation.monitor import SlotMonitor
+
+    try:
+        from ..automation.browser import BrowserManager
+        from ..automation.monitor import SlotMonitor
+    except Exception as e:
+        logger.error(f"Failed to import automation modules: {e}")
+        bot_state["is_running"] = False
+        bot_state["current_step"] = f"Import error: {e}"
+        return
 
     try:
         _browser = BrowserManager()
@@ -292,7 +300,6 @@ async def _run_bot(applicant_dicts: list):
         async def on_slot_found(event, data):
             bot_state["total_success"] += 1
             logger.info(f"Bot event: {event} - {data}")
-            # Try to send Telegram notification
             try:
                 from ..services.notification import NotificationService
                 ns = NotificationService()
@@ -320,10 +327,13 @@ async def _run_bot(applicant_dicts: list):
             except Exception:
                 pass
 
+        logger.info("Starting browser...")
+        bot_state["current_step"] = "Starting browser..."
         page = await _browser.start()
         if not page:
-            logger.error("Failed to start browser")
+            logger.error("Failed to start browser - no page returned")
             bot_state["is_running"] = False
+            bot_state["current_step"] = "Browser failed to start"
             return
 
         bot_state["current_step"] = "Browser started"
@@ -337,8 +347,14 @@ async def _run_bot(applicant_dicts: list):
             "Visto Schengen": ("Visto Schengen", "Visto Schengen (Schengen Visa)"),
             "Visto Nacional": ("Visto Nacional", "Visto Nacional (National visa)"),
             "Job Seeker": ("Job Seeker", "Job seekers"),
+            # Legacy/fallback mappings
+            "TOURIST": ("Visto Schengen", "Visto Schengen (Schengen Visa)"),
+            "BUSINESS": ("Visto Schengen", "Visto Schengen (Schengen Visa)"),
+            "STUDENT": ("Visto Nacional", "Visto Nacional (National visa)"),
+            "WORK": ("Visto Nacional", "Visto Nacional (National visa)"),
         }
         category, subcategory = category_map.get(visa_type, ("Visto Schengen", "Visto Schengen (Schengen Visa)"))
+        logger.info(f"Visa type '{visa_type}' mapped to category: {category} / {subcategory}")
 
         logger.info(f"Starting monitor for {len(applicant_dicts)} applicant(s), category: {category}")
         bot_state["current_step"] = "Monitoring"
@@ -354,7 +370,8 @@ async def _run_bot(applicant_dicts: list):
     except asyncio.CancelledError:
         logger.info("Bot task cancelled")
     except Exception as e:
-        logger.error(f"Bot fatal error: {e}")
+        import traceback
+        logger.error(f"Bot fatal error: {e}\n{traceback.format_exc()}")
         bot_state["current_step"] = f"Fatal: {str(e)}"
     finally:
         bot_state["is_running"] = False
