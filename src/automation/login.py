@@ -509,13 +509,21 @@ class LoginAutomation:
             # ============================================================
             await self._wait_for_login_result(page)
 
+            logger.info(f"Post-login URL: {page.url}")
+
             if await self._is_logged_in(page):
                 logger.info("Login successful!")
                 await self.browser.screenshot("login_success")
+                # Navigate to dashboard if not already there
+                if "/dashboard" not in page.url:
+                    logger.info(f"Authenticated but not on dashboard (URL: {page.url}), navigating...")
+                    await page.goto(VFSUrls.DASHBOARD, wait_until="domcontentloaded", timeout=30000)
+                    await self.browser.random_delay(3000, 5000)
+                    logger.info(f"Now on: {page.url}")
                 return True, "Login successful"
             else:
                 error = await self._get_error_message(page)
-                logger.error(f"Login failed: {error}")
+                logger.error(f"Login failed: {error} (URL: {page.url})")
                 await self.browser.screenshot("login_failed")
                 return False, f"Login failed: {error}"
 
@@ -1091,42 +1099,66 @@ class LoginAutomation:
             logger.debug(f"Overlay removal: {e}")
 
     async def _is_logged_in(self, page: Page) -> bool:
-        """Check if user is logged in (from Screenshot 19: /dashboard with 'Start New Booking')"""
+        """Check if user is logged in.
+
+        After OTP submit, VFS may land on /dashboard, /book-an-appointment,
+        or other authenticated pages. Check URL patterns AND page content.
+        """
         try:
-            if "/dashboard" in page.url:
-                return True
+            url = page.url
+            # URL-based checks
+            authenticated_paths = ["/dashboard", "/application-detail", "/your-details",
+                                   "/book-appointment", "/review-pay", "/confirmation"]
+            for path in authenticated_paths:
+                if path in url:
+                    return True
 
-            dashboard_selectors = [
-                Selectors.NEW_BOOKING_BUTTON,
-                "text=Start New Booking",
-                "text=Active application",
-                "text=No Application(s) Found",
-                "a:has-text('Sign Out')",
-            ]
+            # Content-based checks (works on any page if user is authenticated)
+            is_auth = await page.evaluate("""
+                () => {
+                    const text = document.body?.innerText || '';
+                    // Dashboard indicators
+                    if (text.includes('Start New Booking')) return true;
+                    if (text.includes('Active application')) return true;
+                    if (text.includes('No Application')) return true;
+                    // Sign Out link means authenticated
+                    if (document.querySelector('a[href*="sign-out"]')) return true;
+                    if (text.includes('Sign Out') || text.includes('Logout')) return true;
+                    // Book now on /book-an-appointment while authenticated
+                    if (text.includes('Book now') && !text.includes('Sign In')) return true;
+                    return false;
+                }
+            """)
+            return is_auth
 
-            for selector in dashboard_selectors:
-                try:
-                    element = await page.query_selector(selector)
-                    if element:
-                        return True
-                except:
-                    continue
-
-            return False
         except:
             return False
 
     async def _wait_for_login_result(self, page: Page, timeout: int = 30000):
-        """Wait for login result (dashboard or error)"""
+        """Wait for login result — dashboard, authenticated page, or error.
+
+        After OTP submit, VFS may redirect to /dashboard, /book-an-appointment,
+        or show an error. Must detect all cases.
+        """
         try:
             await page.wait_for_function(
                 """
                 () => {
-                    if (window.location.href.includes('/dashboard')) return true;
+                    const url = window.location.href;
+                    // Authenticated page URLs
+                    if (url.includes('/dashboard')) return true;
+                    if (url.includes('/application-detail')) return true;
+                    // Error indicators
                     if (document.querySelector('.alert-danger')) return true;
                     if (document.querySelector('.error-message')) return true;
-                    // Also check for OTP page (login step 2)
+                    // OTP page (login step 2)
                     if (document.body.innerText.toLowerCase().includes('one time password')) return true;
+                    // Authenticated content (Sign Out visible, Start New Booking, Book now without Sign In)
+                    const text = document.body?.innerText || '';
+                    if (text.includes('Start New Booking')) return true;
+                    if (text.includes('Sign Out') || text.includes('Logout')) return true;
+                    if (document.querySelector('a[href*="sign-out"]')) return true;
+                    if (text.includes('Book now') && !text.includes('Sign In')) return true;
                     return false;
                 }
                 """,
