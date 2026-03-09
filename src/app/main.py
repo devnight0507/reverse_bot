@@ -2,6 +2,7 @@
 FastAPI Application - VFS Booking Bot API
 """
 import asyncio
+import sys
 from contextlib import asynccontextmanager
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, UploadFile, File
@@ -11,6 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pathlib import Path
 import shutil
 from loguru import logger
+
+# On Windows, Playwright needs ProactorEventLoop for subprocess support.
+# This must be set before any event loop is created.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from .config import settings
 from .database import init_db, get_session
