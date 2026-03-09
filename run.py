@@ -49,6 +49,12 @@ async def init():
 def run_api():
     """Run API server"""
     setup_logging()
+
+    # On Windows, Playwright needs ProactorEventLoop to spawn browser subprocesses.
+    # Uvicorn defaults to SelectorEventLoop on Windows which doesn't support this.
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
     logger.info(f"Starting API server on {settings.api_host}:{settings.api_port}")
 
     uvicorn.run(
