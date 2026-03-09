@@ -241,7 +241,7 @@ async def get_statistics(db: AsyncSession = Depends(get_session)):
 
 # ============== Bot Control Routes ==============
 
-# Global bot state (in production, use Redis or database)
+# Global bot state
 bot_state = {
     "is_running": False,
     "current_applicant_id": None,
@@ -253,10 +253,135 @@ bot_state = {
     "next_check": None,
 }
 
+# Global bot instances
+_browser = None
+_monitor = None
+
+
+def _applicant_to_dict(a) -> dict:
+    """Convert SQLAlchemy Applicant model to dict for monitor"""
+    return {
+        "id": a.id,
+        "first_name": a.first_name,
+        "last_name": a.last_name,
+        "email": a.email,
+        "phone": a.phone,
+        "dial_code": a.dial_code,
+        "passport_number": a.passport_number,
+        "passport_expiry": a.passport_expiry,
+        "date_of_birth": a.date_of_birth,
+        "gender": a.gender,
+        "nationality": a.nationality,
+        "visa_type": a.visa_type,
+        "face_photo_path": a.face_photo_path,
+        "passport_front_path": a.passport_front_path,
+        "passport_page_path": a.passport_page_path,
+        "status": a.status,
+    }
+
+
+async def _run_bot(applicant_dicts: list):
+    """Background task: run the slot monitor"""
+    global _browser, _monitor
+    from ..automation.browser import BrowserManager
+    from ..automation.monitor import SlotMonitor
+
+    try:
+        _browser = BrowserManager()
+
+        async def on_slot_found(event, data):
+            bot_state["total_success"] += 1
+            logger.info(f"Bot event: {event} - {data}")
+            # Try to send Telegram notification
+            try:
+                from ..services.notification import NotificationService
+                ns = NotificationService()
+                if event == "slot_found":
+                    await ns.notify_slot_found(data.get("message", "Slots available!"))
+                elif event == "booking_success":
+                    applicant = data.get("applicant", {})
+                    confirmation = data.get("confirmation", {})
+                    await ns.notify_booking_success(
+                        f"{applicant.get('first_name', '')} {applicant.get('last_name', '')}",
+                        str(confirmation.get("appointment_date", "Unknown")),
+                        confirmation_code=confirmation.get("appointment_ref"),
+                    )
+            except Exception as e:
+                logger.error(f"Notification error: {e}")
+
+        async def on_error(event, data):
+            bot_state["total_failed"] += 1
+            bot_state["current_step"] = f"Error: {event}"
+            logger.error(f"Bot error: {event} - {data}")
+            try:
+                from ..services.notification import NotificationService
+                ns = NotificationService()
+                await ns.notify_error(str(data), event)
+            except Exception:
+                pass
+
+        page = await _browser.start()
+        if not page:
+            logger.error("Failed to start browser")
+            bot_state["is_running"] = False
+            return
+
+        bot_state["current_step"] = "Browser started"
+
+        _monitor = SlotMonitor(_browser, on_slot_found=on_slot_found, on_error=on_error)
+
+        # Determine visa category from first applicant
+        visa_type = applicant_dicts[0].get("visa_type", "Visto Schengen") if applicant_dicts else "Visto Schengen"
+        # Map visa_type to category/subcategory
+        category_map = {
+            "Visto Schengen": ("Visto Schengen", "Visto Schengen (Schengen Visa)"),
+            "Visto Nacional": ("Visto Nacional", "Visto Nacional (National visa)"),
+            "Job Seeker": ("Job Seeker", "Job seekers"),
+        }
+        category, subcategory = category_map.get(visa_type, ("Visto Schengen", "Visto Schengen (Schengen Visa)"))
+
+        logger.info(f"Starting monitor for {len(applicant_dicts)} applicant(s), category: {category}")
+        bot_state["current_step"] = "Monitoring"
+
+        await _monitor.start(
+            applicants=applicant_dicts,
+            center="Luanda",
+            category=category,
+            subcategory=subcategory,
+            auto_book=True,
+        )
+
+    except asyncio.CancelledError:
+        logger.info("Bot task cancelled")
+    except Exception as e:
+        logger.error(f"Bot fatal error: {e}")
+        bot_state["current_step"] = f"Fatal: {str(e)}"
+    finally:
+        bot_state["is_running"] = False
+        bot_state["current_step"] = None
+        bot_state["current_applicant_id"] = None
+        if _browser:
+            try:
+                await _browser.stop()
+            except Exception:
+                pass
+            _browser = None
+        _monitor = None
+        logger.info("Bot stopped")
+
+
+# Keep reference to the background task so we can cancel it
+_bot_task = None
+
 
 @app.get("/api/bot/status", response_model=schemas.BotStatusResponse)
 async def get_bot_status():
     """Get current bot status"""
+    # Sync monitor stats if available
+    if _monitor:
+        stats = _monitor.stats
+        bot_state["last_check"] = stats.get("last_check")
+        bot_state["total_processed"] = stats.get("check_count", 0)
     return schemas.BotStatusResponse(**bot_state)
 
 
@@ -266,24 +391,65 @@ async def start_bot(
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_session)
 ):
-    """Start the booking bot"""
+    """Start the booking bot for specified applicants"""
+    global _bot_task
+
     if bot_state["is_running"]:
         raise HTTPException(status_code=400, detail="Bot is already running")
 
-    # TODO: Implement bot start logic
-    bot_state["is_running"] = True
+    # Load applicants from database
+    if request.applicant_ids:
+        applicants = []
+        for aid in request.applicant_ids:
+            a = await crud.get_applicant(db, aid)
+            if a and a.status not in ("booked", "cancelled"):
+                applicants.append(_applicant_to_dict(a))
+        if not applicants:
+            raise HTTPException(status_code=400, detail="No valid applicants found")
+    else:
+        # Load all pending applicants
+        all_applicants = await crud.get_applicants(db, status="pending")
+        applicants = [_applicant_to_dict(a) for a in all_applicants]
+        if not applicants:
+            raise HTTPException(status_code=400, detail="No pending applicants found")
 
-    return {"message": "Bot started", "status": "running"}
+    bot_state["is_running"] = True
+    bot_state["current_applicant_id"] = applicants[0]["id"] if applicants else None
+    bot_state["current_step"] = "Starting..."
+    bot_state["total_processed"] = 0
+    bot_state["total_success"] = 0
+    bot_state["total_failed"] = 0
+
+    # Launch bot as background asyncio task
+    _bot_task = asyncio.create_task(_run_bot(applicants))
+
+    names = ", ".join(a["first_name"] for a in applicants)
+    return {"message": f"Bot started for: {names}", "status": "running"}
 
 
 @app.post("/api/bot/stop")
 async def stop_bot():
     """Stop the booking bot"""
+    global _bot_task
+
     if not bot_state["is_running"]:
         raise HTTPException(status_code=400, detail="Bot is not running")
 
-    # TODO: Implement bot stop logic
+    # Stop the monitor gracefully
+    if _monitor:
+        await _monitor.stop()
+
+    # Cancel the background task if still running
+    if _bot_task and not _bot_task.done():
+        _bot_task.cancel()
+        try:
+            await _bot_task
+        except asyncio.CancelledError:
+            pass
+    _bot_task = None
+
     bot_state["is_running"] = False
+    bot_state["current_step"] = None
 
     return {"message": "Bot stopped", "status": "stopped"}
 
