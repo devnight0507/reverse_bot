@@ -609,56 +609,119 @@ class BookingAutomation:
         try:
             logger.info("Filling applicant details...")
 
-            # Wait for the 28-second countdown
-            logger.info("Waiting 30 seconds (mandatory wait before saving)...")
-            await asyncio.sleep(30)
+            # First wait for the form to be present on the page
+            # Try multiple selector strategies in case formcontrolname doesn't work
+            form_found = False
+            for selector in [
+                Selectors.FIRST_NAME,
+                "input[placeholder*='FIRST NAME' i]",
+                "input[placeholder*='first name' i]",
+                "#mat-input-0",
+            ]:
+                try:
+                    await page.wait_for_selector(selector, timeout=10000)
+                    logger.info(f"Form found via: {selector}")
+                    form_found = True
+                    break
+                except Exception:
+                    continue
 
-            # Wait for form
-            await page.wait_for_selector(Selectors.FIRST_NAME, timeout=10000)
+            if not form_found:
+                # Take screenshot to see what's actually on the page
+                await self.browser.screenshot("form_not_found")
+                # Log all input elements for debugging
+                inputs = await page.evaluate("""() => {
+                    return Array.from(document.querySelectorAll('input')).map(el => ({
+                        type: el.type,
+                        name: el.name,
+                        id: el.id,
+                        placeholder: el.placeholder,
+                        formcontrolname: el.getAttribute('formcontrolname'),
+                        class: el.className.substring(0, 80)
+                    }))
+                }""")
+                logger.error(f"Form not found. Inputs on page: {inputs}")
+                return False, "Form not found on page"
+
+            await self.browser.screenshot("form_found_before_wait")
+
+            # Fill the form fields FIRST (during the 28-second countdown)
+            # The countdown only blocks the Save button, not form input
+            logger.info("Filling form fields...")
 
             # Fill text fields
             fields = [
-                (Selectors.FIRST_NAME, applicant.get("first_name", "")),
-                (Selectors.LAST_NAME, applicant.get("last_name", "")),
-                (Selectors.PASSPORT_NUMBER, applicant.get("passport_number", "")),
-                (Selectors.PHONE_NUMBER, applicant.get("phone", "")),
-                (Selectors.EMAIL, applicant.get("email", "")),
-                (Selectors.CONFIRM_EMAIL, applicant.get("email", "")),
+                (Selectors.FIRST_NAME, "input[placeholder*='FIRST NAME' i]", applicant.get("first_name", "")),
+                (Selectors.LAST_NAME, "input[placeholder*='LAST NAME' i]", applicant.get("last_name", "")),
+                (Selectors.PASSPORT_NUMBER, "input[placeholder*='PASSPORT NUMBER' i]", applicant.get("passport_number", "")),
+                (Selectors.PHONE_NUMBER, "input[placeholder*='CONTACT' i]", applicant.get("phone", "")),
+                (Selectors.EMAIL, "input[placeholder*='EMAIL' i]", applicant.get("email", "")),
             ]
 
-            for selector, value in fields:
-                if value:
+            for primary, fallback, value in fields:
+                if not value:
+                    continue
+                filled = False
+                for sel in [primary, fallback]:
                     try:
-                        await self.browser.human_type(selector, value)
-                        await self.browser.random_delay(200, 500)
-                    except Exception as e:
-                        logger.warning(f"Could not fill {selector}: {e}")
+                        el = await page.wait_for_selector(sel, timeout=3000)
+                        if el:
+                            await el.click()
+                            await el.fill("")
+                            await self.browser.human_type(sel, value)
+                            await self.browser.random_delay(200, 500)
+                            filled = True
+                            logger.info(f"Filled {sel} = {value}")
+                            break
+                    except Exception:
+                        continue
+                if not filled:
+                    logger.warning(f"Could not fill field for: {value}")
+
+            # Confirm email (separate because it might not exist as a field)
+            try:
+                await self.browser.human_type(Selectors.CONFIRM_EMAIL, applicant.get("email", ""))
+            except Exception:
+                logger.warning("Could not fill confirm email field")
+
+            # Handle dropdowns
+            if applicant.get("gender"):
+                await self._select_dropdown(Selectors.GENDER_SELECT, applicant["gender"])
+                await self.browser.random_delay(300, 600)
+
+            if applicant.get("nationality"):
+                await self._select_dropdown(Selectors.NATIONALITY_SELECT, applicant["nationality"])
+                await self.browser.random_delay(300, 600)
+
+            # Handle phone country code
+            if applicant.get("dial_code"):
+                await self._select_dropdown(Selectors.PHONE_CODE, applicant["dial_code"])
+                await self.browser.random_delay(300, 600)
 
             # Handle date fields
             if applicant.get("date_of_birth"):
                 dob = applicant["date_of_birth"]
                 if isinstance(dob, date):
                     dob = dob.strftime("%d/%m/%Y")
-                await self._fill_date_field(Selectors.DOB_INPUT, dob)
+                elif hasattr(dob, 'strftime'):
+                    dob = dob.strftime("%d/%m/%Y")
+                await self._fill_date_field(Selectors.DOB_INPUT, str(dob))
 
             if applicant.get("passport_expiry"):
                 expiry = applicant["passport_expiry"]
                 if isinstance(expiry, date):
                     expiry = expiry.strftime("%d/%m/%Y")
-                await self._fill_date_field(Selectors.PASSPORT_EXPIRY, expiry)
-
-            # Handle dropdowns
-            if applicant.get("gender"):
-                await self._select_dropdown(Selectors.GENDER_SELECT, applicant["gender"])
-
-            if applicant.get("nationality"):
-                await self._select_dropdown(Selectors.NATIONALITY_SELECT, applicant["nationality"])
-
-            # Handle phone country code
-            if applicant.get("dial_code"):
-                await self._select_dropdown(Selectors.PHONE_CODE, applicant["dial_code"])
+                elif hasattr(expiry, 'strftime'):
+                    expiry = expiry.strftime("%d/%m/%Y")
+                await self._fill_date_field(Selectors.PASSPORT_EXPIRY, str(expiry))
 
             await self.browser.screenshot("details_filled")
+            logger.info("Applicant details filled, waiting for countdown to finish...")
+
+            # Now wait remaining time for the 28-second countdown
+            # We've spent ~10-15 seconds filling, so wait the rest
+            await asyncio.sleep(20)
+
             logger.info("Applicant details filled")
             return True, "Applicant details filled"
 
