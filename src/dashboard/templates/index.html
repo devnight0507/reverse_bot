@@ -178,9 +178,22 @@
                                 class="w-full px-3.5 py-2.5 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none transition-shadow">
                         </div>
                         <div>
-                            <label class="block text-sm font-medium text-slate-600 mb-1.5">Phone</label>
-                            <input type="tel" name="phone" required placeholder="+244..."
-                                class="w-full px-3.5 py-2.5 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none transition-shadow">
+                            <label class="block text-sm font-medium text-slate-600 mb-1.5">Contact Number</label>
+                            <div class="flex gap-2">
+                                <select name="dial_code"
+                                    class="w-24 px-2 py-2.5 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none transition-shadow bg-white">
+                                    <option value="+244" selected>+244</option>
+                                    <option value="+351">+351</option>
+                                    <option value="+55">+55</option>
+                                    <option value="+1">+1</option>
+                                    <option value="+44">+44</option>
+                                    <option value="+33">+33</option>
+                                    <option value="+49">+49</option>
+                                    <option value="+34">+34</option>
+                                </select>
+                                <input type="tel" name="phone" required placeholder="912345678"
+                                    class="flex-1 px-3.5 py-2.5 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none transition-shadow">
+                            </div>
                         </div>
                         <div>
                             <label class="block text-sm font-medium text-slate-600 mb-1.5">Passport Number</label>
@@ -211,15 +224,12 @@
                                 class="w-full px-3.5 py-2.5 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none transition-shadow">
                         </div>
                         <div>
-                            <label class="block text-sm font-medium text-slate-600 mb-1.5">Visa Type</label>
+                            <label class="block text-sm font-medium text-slate-600 mb-1.5">Visa Category</label>
                             <select name="visa_type"
                                 class="w-full px-3.5 py-2.5 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-brand-500 focus:border-brand-500 outline-none transition-shadow bg-white">
-                                <option value="TOURIST">Tourist</option>
-                                <option value="BUSINESS">Business</option>
-                                <option value="STUDENT">Student</option>
-                                <option value="WORK">Work</option>
-                                <option value="FAMILY">Family</option>
-                                <option value="TRANSIT">Transit</option>
+                                <option value="Visto Schengen">Visto Schengen</option>
+                                <option value="Visto Nacional">Visto Nacional</option>
+                                <option value="Job Seeker">Job Seeker</option>
                             </select>
                         </div>
                     </div>
@@ -273,7 +283,9 @@
                         <p class="text-xs text-slate-400 mt-0.5">${a.email}</p>
                     </td>
                     <td class="py-3.5 px-5 text-slate-600 font-mono text-xs">${a.passport_number}</td>
-                    <td class="py-3.5 px-5"><span class="text-xs font-medium text-slate-500 bg-slate-100 px-2 py-1 rounded">${a.visa_type}</span></td>
+                    <td class="py-3.5 px-5"><span class="text-xs font-medium text-slate-500 bg-slate-100 px-2 py-1 rounded">${a.visa_type}</span>
+                        <p class="text-xs text-slate-400 mt-0.5">${a.dial_code || '+244'} ${a.phone}</p>
+                    </td>
                     <td class="py-3.5 px-5">${statusBadge(a.status)}</td>
                     <td class="py-3.5 px-5 text-right">
                         <button onclick="deleteApplicant(${a.id})" class="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors" title="Delete">

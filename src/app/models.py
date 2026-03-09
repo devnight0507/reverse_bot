@@ -17,6 +17,7 @@ class Applicant(Base):
     last_name: Mapped[str] = mapped_column(String(100), nullable=False)
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     phone: Mapped[str] = mapped_column(String(50), nullable=False)
+    dial_code: Mapped[str] = mapped_column(String(10), default="+244")  # Angola country code
     passport_number: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
     passport_expiry: Mapped[date] = mapped_column(Date, nullable=False)
     date_of_birth: Mapped[date] = mapped_column(Date, nullable=False)

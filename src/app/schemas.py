@@ -14,6 +14,7 @@ class ApplicantBase(BaseModel):
     last_name: str = Field(..., min_length=1, max_length=100)
     email: EmailStr
     phone: str = Field(..., min_length=5, max_length=50)
+    dial_code: str = Field(default="+244", max_length=10)
     passport_number: str = Field(..., min_length=5, max_length=50)
     passport_expiry: date
     date_of_birth: date
@@ -35,6 +36,7 @@ class ApplicantUpdate(BaseModel):
     last_name: Optional[str] = Field(None, min_length=1, max_length=100)
     email: Optional[EmailStr] = None
     phone: Optional[str] = Field(None, min_length=5, max_length=50)
+    dial_code: Optional[str] = Field(None, max_length=10)
     passport_number: Optional[str] = Field(None, min_length=5, max_length=50)
     passport_expiry: Optional[date] = None
     date_of_birth: Optional[date] = None
