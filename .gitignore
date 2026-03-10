@@ -26,6 +26,7 @@ data/session.json
 data/browser_profile
 data/video_screenshot
 data/chrome_profile/
+data/uploads/
 
 # OS
 .DS_Store
