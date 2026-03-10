@@ -204,8 +204,7 @@ class SlotMonitor:
                                 if not success:
                                     continue
 
-                                # Handle modals
-                                await self.booking.handle_reminder_modal()
+                                # Handle service fee notice (if it appears)
                                 await self.booking.handle_service_fee_notice()
 
                                 # Identity verification (pass applicant for uploaded photos)

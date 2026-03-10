@@ -110,18 +110,20 @@ class Selectors:
     # From actual VFS HTML: formcontrolname="paymentMode" (label: "Select the payment mode")
     PAYMENT_MODE_SELECT = "mat-select[formcontrolname='paymentMode']"
 
-    # Booking Form - Applicant Details
-    FIRST_NAME = "input[formcontrolname='firstName']"
-    LAST_NAME = "input[formcontrolname='lastName']"
-    GENDER_SELECT = "mat-select[formcontrolname='gender']"
-    DOB_INPUT = "input[formcontrolname='dateOfBirth']"
-    NATIONALITY_SELECT = "mat-select[formcontrolname='nationality']"
-    PASSPORT_NUMBER = "input[formcontrolname='passportNumber']"
-    PASSPORT_EXPIRY = "input[formcontrolname='passportExpiryDate']"
-    PHONE_CODE = "mat-select[formcontrolname='dialCode']"
-    PHONE_NUMBER = "input[formcontrolname='mobileNumber']"
-    EMAIL = "input[formcontrolname='emailId']"
-    CONFIRM_EMAIL = "input[formcontrolname='confirmEmailId']"
+    # Booking Form - Applicant Details (Your Details page)
+    # VFS uses dynamic forms (app-dynamic-control) — NO formcontrolname attributes.
+    # IDs like mat-input-4 are dynamic. Use label-relative and placeholder selectors.
+    FIRST_NAME = "app-input-control:has(div:text-is('First Name')) input[matinput]"
+    LAST_NAME = "app-input-control:has(div:text-is('Last Name')) input[matinput]"
+    GENDER_SELECT = "app-dropdown:has(div:text-is('Gender')) mat-select"
+    DOB_INPUT = "input#dateOfBirth"
+    NATIONALITY_SELECT = "app-dropdown:has(div:text-is('Current Nationality')) mat-select"
+    PASSPORT_NUMBER = "app-input-control:has(div:text-is('Passport Number')) input[matinput]"
+    PASSPORT_EXPIRY = "input#passportExpirtyDate"  # Note: VFS has typo "Expirty"
+    PHONE_CODE = "app-input-control:has(div:text-is('Contact number')) input[placeholder='44']"
+    PHONE_NUMBER = "app-input-control:has(div:text-is('Contact number')) input[maxlength='15']"
+    EMAIL = "app-input-control:has(div:text-is('Email')) input[type='email']"
+    CONFIRM_EMAIL = "app-input-control:has(div:text-is('Confirm Email')) input[type='email']"
 
     # Slot Availability (application-detail page)
     NO_SLOTS_MESSAGE = ".alert.alert-info, .alert-info, .info-alert"

@@ -309,7 +309,8 @@ async def _run_bot(applicant_dicts: list):
                 from ..services.notification import NotificationService
                 ns = NotificationService()
                 if event == "slot_found":
-                    await ns.notify_slot_found(data.get("message", "Slots available!"))
+                    dates = data.get("dates", [])
+                    await ns.notify_slot_found(dates if dates else [data.get("message", "Slots available!")])
                 elif event == "booking_success":
                     applicant = data.get("applicant", {})
                     confirmation = data.get("confirmation", {})

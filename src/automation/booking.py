@@ -600,8 +600,240 @@ class BookingAutomation:
     # Phase 6: Your Details
     # ================================================================
 
+    async def _fill_input_by_label(self, page, label_text: str, value: str):
+        """Fill an input field by finding it relative to its label text.
+        VFS uses app-dynamic-control > app-input-control with label divs."""
+        # Strategy 1: Find by Playwright label-relative selector
+        for sel in [
+            f"app-input-control:has(div:text-is('{label_text}')) input[matinput]",
+            f"app-input-control:has(:text('{label_text}')) input",
+        ]:
+            try:
+                el = await page.wait_for_selector(sel, timeout=3000)
+                if el:
+                    await el.click()
+                    await el.fill("")
+                    await self.browser.human_type(sel, value)
+                    logger.info(f"Filled '{label_text}' = {value}")
+                    return True
+            except Exception:
+                continue
+
+        # Strategy 2: Use JS to find input near the label text
+        try:
+            filled = await page.evaluate("""(args) => {
+                const [labelText, value] = args;
+                // Find all text nodes that match the label
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                while (walker.nextNode()) {
+                    if (walker.currentNode.textContent.trim().startsWith(labelText)) {
+                        // Walk up to find the app-dynamic-control container
+                        let container = walker.currentNode.parentElement;
+                        for (let i = 0; i < 8; i++) {
+                            if (!container) break;
+                            const input = container.querySelector('input[matinput], input.mat-mdc-input-element');
+                            if (input) {
+                                input.focus();
+                                input.value = '';
+                                input.dispatchEvent(new Event('input', {bubbles: true}));
+                                // Type each character
+                                for (const ch of value) {
+                                    input.value += ch;
+                                    input.dispatchEvent(new Event('input', {bubbles: true}));
+                                }
+                                input.dispatchEvent(new Event('change', {bubbles: true}));
+                                input.dispatchEvent(new Event('blur', {bubbles: true}));
+                                return true;
+                            }
+                            container = container.parentElement;
+                        }
+                    }
+                }
+                return false;
+            }""", [label_text, value])
+            if filled:
+                logger.info(f"Filled '{label_text}' = {value} (via JS)")
+                return True
+        except Exception as e:
+            logger.warning(f"JS fill failed for '{label_text}': {e}")
+
+        logger.warning(f"Could not fill '{label_text}'")
+        return False
+
+    async def _fill_ngb_date(self, page, field_id: str, date_value):
+        """Fill an ngb-datepicker date field by ID.
+
+        ngb-datepicker has an internal NgbDateStruct model {year, month, day}.
+        Just typing text doesn't update the model — must use Angular's API
+        or simulate the datepicker calendar selection.
+        """
+        # Parse date into components
+        if isinstance(date_value, date):
+            year, month, day = date_value.year, date_value.month, date_value.day
+        elif hasattr(date_value, 'year'):
+            year, month, day = date_value.year, date_value.month, date_value.day
+        else:
+            # Parse string like "18/05/1985" or "1985-05-18"
+            s = str(date_value)
+            if "/" in s:
+                parts = s.split("/")
+                day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+            elif "-" in s:
+                parts = s.split("-")
+                year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+            else:
+                logger.warning(f"Cannot parse date: {date_value}")
+                return False
+
+        date_str = f"{day:02d}/{month:02d}/{year}"
+
+        try:
+            # Use Angular's ngbDatepicker API to set the model properly
+            success = await page.evaluate("""(args) => {
+                const [fieldId, year, month, day, dateStr] = args;
+                const input = document.getElementById(fieldId);
+                if (!input) return false;
+
+                // Get the Angular component instance via __ngContext__ or ng.getComponent
+                // Method 1: Use ng.probe (Angular debug tools)
+                try {
+                    const ngRef = window.ng;
+                    if (ngRef && ngRef.getComponent) {
+                        // Walk up from input to find the datepicker component
+                        let el = input.closest('app-ngb-datepicker');
+                        if (el) {
+                            const comp = ngRef.getComponent(el);
+                            if (comp && comp.writeValue) {
+                                comp.writeValue({year, month, day});
+                                if (comp.onChange) comp.onChange({year, month, day});
+                                input.value = dateStr;
+                                return true;
+                            }
+                        }
+                    }
+                } catch(e) {}
+
+                // Method 2: Trigger ngModelChange through input events
+                // ngb-datepicker listens for input events and parses via NgbDateParserFormatter
+                // The default parser expects yyyy-mm-dd format
+                const isoStr = `${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+
+                input.focus();
+                // Try setting with ISO format first (default ngb parser)
+                input.value = isoStr;
+                input.dispatchEvent(new Event('input', {bubbles: true}));
+                input.dispatchEvent(new Event('change', {bubbles: true}));
+
+                // Check if Angular picked it up (input might reformat)
+                // Small delay then set display format
+                setTimeout(() => {
+                    // If the value was accepted, ngb may have reformatted it
+                    // If not, try the dd/mm/yyyy format
+                    if (input.classList.contains('ng-invalid')) {
+                        input.value = dateStr;
+                        input.dispatchEvent(new Event('input', {bubbles: true}));
+                        input.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                    input.dispatchEvent(new Event('blur', {bubbles: true}));
+                }, 100);
+
+                return true;
+            }""", [field_id, year, month, day, date_str])
+
+            if success:
+                logger.info(f"Set date #{field_id} via Angular API: {date_str}")
+                await self.browser.random_delay(300, 500)
+
+                # Also try clicking the calendar icon and selecting the date
+                # This is the most reliable way to set ngb-datepicker
+                try:
+                    # Find the calendar toggle button next to this input
+                    toggle = await page.query_selector(
+                        f"#{field_id} ~ .input-group-addon, "
+                        f"app-ngb-datepicker:has(#{field_id}) .input-group-addon"
+                    )
+                    if toggle:
+                        await toggle.click()
+                        await self.browser.random_delay(500, 800)
+
+                        # Navigate to the correct month/year and click the day
+                        await self._select_datepicker_date(page, year, month, day)
+                        logger.info(f"Selected date via calendar: {date_str}")
+                except Exception as e:
+                    logger.info(f"Calendar selection skipped: {e}")
+
+                return True
+
+        except Exception as e:
+            logger.warning(f"Could not fill date #{field_id}: {e}")
+
+        # Last resort: type the date and hope VFS has a custom parser
+        try:
+            el = await page.wait_for_selector(f"#{field_id}", timeout=3000)
+            if el:
+                await el.click()
+                await el.fill("")
+                await page.keyboard.type(date_str, delay=50)
+                await page.keyboard.press("Tab")
+                await self.browser.random_delay(200, 400)
+                logger.info(f"Typed date #{field_id} = {date_str}")
+                return True
+        except Exception as e:
+            logger.warning(f"Typing date failed for #{field_id}: {e}")
+            return False
+
+    async def _select_datepicker_date(self, page, year: int, month: int, day: int):
+        """Navigate ngb-datepicker calendar to select a specific date."""
+        # ngb-datepicker opens a dropdown calendar
+        # It has navigation arrows and a month/year selector
+
+        # Click the month/year title to switch to year view for faster navigation
+        try:
+            # Wait for datepicker dropdown
+            await page.wait_for_selector("ngb-datepicker", timeout=3000)
+
+            # Click the navigation label (shows "Month Year") to go to year selection
+            nav_label = await page.query_selector(
+                "ngb-datepicker-navigation .ngb-dp-navigation-select"
+            )
+            if nav_label:
+                # Use the select dropdowns for month and year
+                # Month select
+                month_select = await page.query_selector(
+                    "ngb-datepicker-navigation select:first-of-type"
+                )
+                if month_select:
+                    await month_select.select_option(str(month))
+                    await self.browser.random_delay(200, 400)
+
+                # Year select
+                year_select = await page.query_selector(
+                    "ngb-datepicker-navigation select:last-of-type"
+                )
+                if year_select:
+                    await year_select.select_option(str(year))
+                    await self.browser.random_delay(200, 400)
+
+                # Click the day
+                day_btn = await page.query_selector(
+                    f"ngb-datepicker-month .ngb-dp-day div:text-is('{day}')"
+                )
+                if day_btn:
+                    await day_btn.click()
+                    await self.browser.random_delay(200, 400)
+                    return True
+
+        except Exception as e:
+            logger.warning(f"Calendar date selection failed: {e}")
+            # Close the datepicker
+            await page.keyboard.press("Escape")
+
+        return False
+
     async def fill_applicant_details(self, applicant: Dict) -> Tuple[bool, str]:
-        """Fill applicant details form with 28-second wait"""
+        """Fill applicant details form (Your Details page).
+        VFS uses app-dynamic-form with app-dynamic-control components.
+        Fields have NO formcontrolname — use labels and IDs instead."""
         page = self.browser.page
         if not page:
             return False, "Browser not started"
@@ -609,117 +841,116 @@ class BookingAutomation:
         try:
             logger.info("Filling applicant details...")
 
-            # First wait for the form to be present on the page
-            # Try multiple selector strategies in case formcontrolname doesn't work
+            # Wait for the Your Details page to load
+            # Check for h1 "Your Details" or the form structure
             form_found = False
             for selector in [
-                Selectors.FIRST_NAME,
-                "input[placeholder*='FIRST NAME' i]",
+                "h1:text-is('Your Details')",
+                "app-applicant-details",
+                "input#dateOfBirth",
                 "input[placeholder*='first name' i]",
-                "#mat-input-0",
             ]:
                 try:
-                    await page.wait_for_selector(selector, timeout=10000)
-                    logger.info(f"Form found via: {selector}")
+                    await page.wait_for_selector(selector, timeout=15000)
+                    logger.info(f"Your Details page detected via: {selector}")
                     form_found = True
                     break
                 except Exception:
                     continue
 
             if not form_found:
-                # Take screenshot to see what's actually on the page
                 await self.browser.screenshot("form_not_found")
-                # Log all input elements for debugging
                 inputs = await page.evaluate("""() => {
-                    return Array.from(document.querySelectorAll('input')).map(el => ({
-                        type: el.type,
-                        name: el.name,
-                        id: el.id,
-                        placeholder: el.placeholder,
-                        formcontrolname: el.getAttribute('formcontrolname'),
-                        class: el.className.substring(0, 80)
+                    return Array.from(document.querySelectorAll('input, mat-select')).map(el => ({
+                        tag: el.tagName, id: el.id,
+                        placeholder: el.placeholder || '',
+                        class: el.className.substring(0, 60)
                     }))
                 }""")
-                logger.error(f"Form not found. Inputs on page: {inputs}")
-                return False, "Form not found on page"
+                logger.error(f"Your Details form not found. Elements: {inputs}")
+                return False, "Your Details form not found"
 
-            await self.browser.screenshot("form_found_before_wait")
+            await self.browser.screenshot("form_found")
+            logger.info("Form found, filling fields during countdown...")
 
-            # Fill the form fields FIRST (during the 28-second countdown)
-            # The countdown only blocks the Save button, not form input
-            logger.info("Filling form fields...")
+            # Fill text fields by label
+            await self._fill_input_by_label(page, "First Name", applicant.get("first_name", ""))
+            await self.browser.random_delay(300, 600)
 
-            # Fill text fields
-            fields = [
-                (Selectors.FIRST_NAME, "input[placeholder*='FIRST NAME' i]", applicant.get("first_name", "")),
-                (Selectors.LAST_NAME, "input[placeholder*='LAST NAME' i]", applicant.get("last_name", "")),
-                (Selectors.PASSPORT_NUMBER, "input[placeholder*='PASSPORT NUMBER' i]", applicant.get("passport_number", "")),
-                (Selectors.PHONE_NUMBER, "input[placeholder*='CONTACT' i]", applicant.get("phone", "")),
-                (Selectors.EMAIL, "input[placeholder*='EMAIL' i]", applicant.get("email", "")),
-            ]
+            await self._fill_input_by_label(page, "Last Name", applicant.get("last_name", ""))
+            await self.browser.random_delay(300, 600)
 
-            for primary, fallback, value in fields:
-                if not value:
-                    continue
-                filled = False
-                for sel in [primary, fallback]:
-                    try:
-                        el = await page.wait_for_selector(sel, timeout=3000)
-                        if el:
-                            await el.click()
-                            await el.fill("")
-                            await self.browser.human_type(sel, value)
-                            await self.browser.random_delay(200, 500)
-                            filled = True
-                            logger.info(f"Filled {sel} = {value}")
-                            break
-                    except Exception:
-                        continue
-                if not filled:
-                    logger.warning(f"Could not fill field for: {value}")
-
-            # Confirm email (separate because it might not exist as a field)
-            try:
-                await self.browser.human_type(Selectors.CONFIRM_EMAIL, applicant.get("email", ""))
-            except Exception:
-                logger.warning("Could not fill confirm email field")
-
-            # Handle dropdowns
+            # Gender dropdown (mat-select)
             if applicant.get("gender"):
                 await self._select_dropdown(Selectors.GENDER_SELECT, applicant["gender"])
                 await self.browser.random_delay(300, 600)
 
+            # Date of Birth (ngb-datepicker with id="dateOfBirth")
+            if applicant.get("date_of_birth"):
+                await self._fill_ngb_date(page, "dateOfBirth", applicant["date_of_birth"])
+                await self.browser.random_delay(300, 600)
+
+            # Nationality dropdown (mat-select)
             if applicant.get("nationality"):
                 await self._select_dropdown(Selectors.NATIONALITY_SELECT, applicant["nationality"])
                 await self.browser.random_delay(300, 600)
 
-            # Handle phone country code
-            if applicant.get("dial_code"):
-                await self._select_dropdown(Selectors.PHONE_CODE, applicant["dial_code"])
+            # Passport Number
+            await self._fill_input_by_label(page, "Passport Number", applicant.get("passport_number", ""))
+            await self.browser.random_delay(300, 600)
+
+            # Passport Expiry Date (ngb-datepicker with id="passportExpirtyDate" — VFS typo)
+            if applicant.get("passport_expiry"):
+                await self._fill_ngb_date(page, "passportExpirtyDate", applicant["passport_expiry"])
                 await self.browser.random_delay(300, 600)
 
-            # Handle date fields
-            if applicant.get("date_of_birth"):
-                dob = applicant["date_of_birth"]
-                if isinstance(dob, date):
-                    dob = dob.strftime("%d/%m/%Y")
-                elif hasattr(dob, 'strftime'):
-                    dob = dob.strftime("%d/%m/%Y")
-                await self._fill_date_field(Selectors.DOB_INPUT, str(dob))
+            # Contact number: dial code input + phone number input
+            # Dial code is a small input (maxlength=3, placeholder="44")
+            dial_code = applicant.get("dial_code", "+244")
+            # Strip the + for the dial code field
+            dial_digits = dial_code.lstrip("+")
+            try:
+                dial_el = await page.wait_for_selector(
+                    "input[placeholder='44'], input[maxlength='3']", timeout=3000
+                )
+                if dial_el:
+                    await dial_el.click()
+                    await dial_el.fill("")
+                    await page.keyboard.type(dial_digits, delay=50)
+                    logger.info(f"Filled dial code = {dial_digits}")
+            except Exception as e:
+                logger.warning(f"Could not fill dial code: {e}")
+            await self.browser.random_delay(200, 400)
 
-            if applicant.get("passport_expiry"):
-                expiry = applicant["passport_expiry"]
-                if isinstance(expiry, date):
-                    expiry = expiry.strftime("%d/%m/%Y")
-                elif hasattr(expiry, 'strftime'):
-                    expiry = expiry.strftime("%d/%m/%Y")
-                await self._fill_date_field(Selectors.PASSPORT_EXPIRY, str(expiry))
+            # Phone number (larger input, maxlength=15)
+            phone = applicant.get("phone", "")
+            try:
+                phone_el = await page.wait_for_selector(
+                    "input[maxlength='15'], input[placeholder*='012345']", timeout=3000
+                )
+                if phone_el:
+                    await phone_el.click()
+                    await phone_el.fill("")
+                    await page.keyboard.type(phone, delay=30)
+                    logger.info(f"Filled phone = {phone}")
+            except Exception as e:
+                logger.warning(f"Could not fill phone: {e}")
+            await self.browser.random_delay(300, 600)
+
+            # Email
+            await self._fill_input_by_label(page, "Email", applicant.get("email", ""))
+            await self.browser.random_delay(300, 600)
+
+            # Confirm Email (may or may not exist on the form)
+            try:
+                await self._fill_input_by_label(page, "Confirm Email", applicant.get("email", ""))
+            except Exception:
+                logger.info("No Confirm Email field found (may not be required)")
 
             await self.browser.screenshot("details_filled")
-            logger.info("Applicant details filled, waiting for countdown to finish...")
+            logger.info("All fields filled. Waiting for 28-second countdown to finish...")
 
-            # Now wait remaining time for the 28-second countdown
-            # We've spent ~10-15 seconds filling, so wait the rest
+            # Wait remaining time for the mandatory countdown before Save is enabled
             await asyncio.sleep(20)
 
             logger.info("Applicant details filled")
@@ -731,72 +962,123 @@ class BookingAutomation:
             return False, f"Failed to fill applicant details: {str(e)}"
 
     async def save_applicant_details(self) -> Tuple[bool, str]:
-        """Click Save button after filling applicant form"""
+        """Click Save → solve Turnstile captcha → click Submit → handle Reminder modal.
+
+        After clicking Save, VFS shows a "Verify Captcha" modal with Cloudflare Turnstile.
+        After solving and clicking Submit, a Reminder modal appears ("keep your passport handy").
+        """
         page = self.browser.page
         if not page:
             return False, "Browser not started"
 
         try:
-            logger.info("Saving applicant details...")
+            logger.info("Clicking Save button...")
 
             await page.wait_for_selector(Selectors.SAVE_BUTTON, timeout=10000)
             await self.browser.random_delay(500, 1000)
             await self.browser.human_click(Selectors.SAVE_BUTTON)
             await self.browser.random_delay(2000, 3000)
 
-            await self._wait_for_loading(page)
+            await self.browser.screenshot("save_clicked")
+
+            # Step 1: Handle Turnstile captcha modal ("Verify Captcha")
+            logger.info("Checking for Verify Captcha modal...")
+            try:
+                captcha_modal = await page.wait_for_selector(
+                    "h4:text-is('Verify Captcha'), "
+                    "mat-dialog-container:has-text('Verify Captcha'), "
+                    ".mat-mdc-dialog-title:has-text('Verify Captcha')",
+                    timeout=10000,
+                )
+                if captcha_modal:
+                    logger.info("Verify Captcha modal detected - solving Turnstile...")
+                    await self.browser.screenshot("captcha_modal_found")
+
+                    # Solve the Turnstile within the modal
+                    from .turnstile import TurnstileSolver
+                    solver = TurnstileSolver(self.browser)
+                    solved = await solver.solve(page)
+
+                    if solved:
+                        logger.info("Turnstile solved, clicking Submit...")
+                    else:
+                        logger.warning("Turnstile may not be solved, trying Submit anyway...")
+
+                    await self.browser.random_delay(1000, 2000)
+
+                    # Click Submit button in the captcha modal
+                    submit_selectors = [
+                        "mat-dialog-container button:has-text('Submit')",
+                        ".cdk-overlay-container button:has-text('Submit')",
+                        "app-captcha-modal button:has-text('Submit')",
+                        "button:has-text('Submit')",
+                    ]
+                    submitted = False
+                    for sel in submit_selectors:
+                        try:
+                            btn = await page.query_selector(sel)
+                            if btn and await btn.is_visible():
+                                await btn.click()
+                                logger.info("Submit button clicked")
+                                submitted = True
+                                break
+                        except Exception:
+                            continue
+
+                    if not submitted:
+                        logger.warning("Could not click Submit button")
+                        await self.browser.screenshot("submit_not_found")
+
+                    await self.browser.random_delay(2000, 3000)
+                    await self._wait_for_loading(page)
+            except Exception as e:
+                logger.info(f"No Verify Captcha modal: {e}")
+
+            await self.browser.screenshot("after_captcha_submit")
+
+            # Step 2: Handle Reminder modal ("Please keep your passport handy")
+            logger.info("Checking for Reminder modal...")
+            try:
+                # Wait for the Reminder modal (app-same-passport-modal)
+                reminder = await page.wait_for_selector(
+                    "app-same-passport-modal, "
+                    "mat-dialog-container:has-text('Reminder'), "
+                    "mat-dialog-container:has-text('passport handy')",
+                    timeout=10000,
+                )
+                if reminder:
+                    logger.info("Reminder modal detected")
+                    await self.browser.screenshot("reminder_modal")
+
+                    # Click Continue button in the modal
+                    continue_selectors = [
+                        "app-same-passport-modal button:has-text('Continue')",
+                        "mat-dialog-container button:has-text('Continue')",
+                        ".cdk-overlay-container button:has-text('Continue')",
+                    ]
+                    for sel in continue_selectors:
+                        try:
+                            btn = await page.query_selector(sel)
+                            if btn and await btn.is_visible():
+                                await btn.click()
+                                logger.info("Reminder Continue clicked")
+                                break
+                        except Exception:
+                            continue
+
+                    await self.browser.random_delay(2000, 3000)
+                    await self._wait_for_loading(page)
+            except Exception as e:
+                logger.info(f"No Reminder modal: {e}")
+
             await self.browser.screenshot("details_saved")
-            logger.info("Applicant details saved")
+            logger.info("Applicant details saved successfully")
             return True, "Details saved"
 
         except Exception as e:
             logger.error(f"Failed to save details: {e}")
             await self.browser.screenshot("save_error")
             return False, f"Failed to save details: {str(e)}"
-
-    async def handle_reminder_modal(self) -> Tuple[bool, str]:
-        """Handle 'Please keep your passport handy' reminder modal"""
-        page = self.browser.page
-        if not page:
-            return False, "Browser not started"
-
-        try:
-            logger.info("Checking for Reminder modal...")
-
-            # Wait for modal to appear
-            await asyncio.sleep(2)
-
-            # Look for modal with reminder text
-            body_text = await page.text_content("body")
-            if body_text and "passport handy" in body_text.lower():
-                logger.info("Reminder modal detected")
-
-                # Click Continue in the modal
-                continue_selectors = [
-                    "mat-dialog-container button:has-text('Continue')",
-                    ".modal button:has-text('Continue')",
-                    ".cdk-overlay-container button:has-text('Continue')",
-                    "button:has-text('Continue')",
-                ]
-
-                for selector in continue_selectors:
-                    try:
-                        btn = await page.query_selector(selector)
-                        if btn and await btn.is_visible():
-                            await btn.click()
-                            logger.info("Reminder modal dismissed")
-                            await self.browser.random_delay(1000, 2000)
-                            await self._wait_for_loading(page)
-                            return True, "Reminder modal handled"
-                    except:
-                        continue
-
-            logger.info("No reminder modal found")
-            return True, "No reminder modal"
-
-        except Exception as e:
-            logger.error(f"Reminder modal error: {e}")
-            return True, f"Reminder modal handling: {str(e)}"
 
     async def handle_service_fee_notice(self) -> Tuple[bool, str]:
         """Handle service fee notice (AOA 40,700.00) and click Continue"""
@@ -887,14 +1169,36 @@ class BookingAutomation:
             logger.error(f"Failed to inject fake camera: {e}")
             return False
 
-    async def handle_identity_verification(self, applicant: Optional[Dict] = None) -> Tuple[bool, str]:
-        """Handle identity verification - detect and wait for completion
+    async def _click_mui_continue(self, page, context: str = "") -> bool:
+        """Click a MUI Continue button on idnvui.vfsglobal.com pages."""
+        selectors = [
+            "button.MuiButton-containedPrimary:has-text('Continue')",
+            "button.MuiButton-root:has-text('Continue')",
+            "button:has-text('CONTINUE')",
+            "button:has-text('Continue')",
+        ]
+        for sel in selectors:
+            try:
+                btn = await page.wait_for_selector(sel, timeout=5000)
+                if btn and await btn.is_visible():
+                    await btn.click()
+                    logger.info(f"Clicked Continue{' - ' + context if context else ''}")
+                    return True
+            except Exception:
+                continue
+        logger.warning(f"Could not find Continue button{' - ' + context if context else ''}")
+        return False
 
-        Identity verification happens on idnvui.vfsglobal.com and requires
-        a camera (face liveness + passport scan). The bot can either:
-        1. Inject uploaded photos as fake camera via JS getUserMedia override
-        2. Use Chrome --use-fake-device-for-media-stream flag (set at launch)
-        3. Pause and wait for human to complete manually
+    async def handle_identity_verification(self, applicant: Optional[Dict] = None) -> Tuple[bool, str]:
+        """Handle identity verification on idnvui.vfsglobal.com.
+
+        Full flow:
+        1. "Start Identity Verification" page → click CONTINUE
+        2. Camera permission → face liveness check ("Move face in front of camera")
+        3. "Start Passport Verification" page → click CONTINUE
+        4. Passport front capture → click CAPTURE (10s countdown)
+        5. Passport photo page capture → click CAPTURE (10s countdown)
+        6. "Security check completed" → redirects back to visa.vfsglobal.com
         """
         page = self.browser.page
         if not page:
@@ -905,162 +1209,258 @@ class BookingAutomation:
             await asyncio.sleep(3)
 
             # Check if redirected to identity verification domain
-            if "idnvui.vfsglobal.com" in page.url:
-                logger.info("Identity verification page detected!")
-                await self.browser.screenshot("identity_verification_start")
+            if "idnvui.vfsglobal.com" not in page.url:
+                logger.info("No identity verification redirect detected")
+                return True, "No identity verification needed"
 
-                # Check if applicant has uploaded photos
-                face_photo = applicant.get("face_photo_path") if applicant else None
-                passport_front = applicant.get("passport_front_path") if applicant else None
-                passport_page = applicant.get("passport_page_path") if applicant else None
-                has_photos = face_photo or passport_front or passport_page
+            logger.info(f"Identity verification page detected: {page.url}")
+            await self.browser.screenshot("idv_start")
 
-                if has_photos:
-                    logger.info("Applicant has uploaded ID photos - will attempt auto-verification")
-                else:
-                    logger.info("No uploaded photos - waiting for manual verification")
+            # Check if applicant has uploaded photos
+            face_photo = applicant.get("face_photo_path") if applicant else None
+            passport_front = applicant.get("passport_front_path") if applicant else None
+            passport_page = applicant.get("passport_page_path") if applicant else None
+            has_photos = face_photo or passport_front or passport_page
 
-                # Notify via callback (Telegram)
-                if self._on_verification_needed:
-                    try:
-                        msg = ("Identity verification started. "
-                               + ("Using uploaded photos for auto-verification." if has_photos
-                                  else "Please complete face + passport verification on the computer."))
-                        if asyncio.iscoroutinefunction(self._on_verification_needed):
-                            await self._on_verification_needed("verification_needed", msg)
-                        else:
-                            self._on_verification_needed("verification_needed", msg)
-                    except Exception as e:
-                        logger.error(f"Verification callback error: {e}")
+            if has_photos:
+                logger.info("Applicant has uploaded ID photos - will attempt auto-verification")
+            else:
+                logger.info("No uploaded photos - waiting for manual verification")
 
-                # Step 1: Click Continue on the start page (health & safety advisory)
-                try:
-                    continue_btn = await page.query_selector("button:has-text('CONTINUE'), button:has-text('Continue')")
-                    if continue_btn:
-                        await continue_btn.click()
-                        logger.info("Clicked Continue on verification start page")
-                        await self.browser.random_delay(2000, 3000)
-                except:
-                    pass
+            # ============================================================
+            # Step 1: "Start Identity Verification" page → click CONTINUE
+            # ============================================================
+            try:
+                await page.wait_for_selector(
+                    "h1:has-text('Start Identity Verification'), "
+                    "h1:has-text('Identity Verification')",
+                    timeout=15000,
+                )
+                logger.info("'Start Identity Verification' page loaded")
+                await self.browser.screenshot("idv_step1_start")
+                await self.browser.random_delay(1000, 2000)
 
-                # Step 2: Inject face photo for liveness check
-                if face_photo:
+                await self._click_mui_continue(page, "Start Identity Verification")
+                await self.browser.random_delay(2000, 3000)
+            except Exception as e:
+                logger.warning(f"Start Identity Verification page not detected: {e}")
+
+            # ============================================================
+            # Step 2: Face liveness check (camera: "Move face in front of camera")
+            # ============================================================
+            logger.info("Face liveness check - camera should be active...")
+            await self.browser.screenshot("idv_step2_face_camera")
+
+            # If we have a face photo, inject it as fake camera
+            if face_photo:
+                await asyncio.sleep(2)
+                await self._inject_fake_camera(page, face_photo)
+                logger.info("Face photo injected as camera feed")
+
+            # Wait for face check to complete → "Start Passport Verification" appears
+            # or security check completed, or redirected back to VFS
+            logger.info("Waiting for face liveness to complete (up to 3 minutes)...")
+            try:
+                await page.wait_for_function(
+                    """() => {
+                        const text = document.body?.innerText?.toLowerCase() || '';
+                        return text.includes('passport verification') ||
+                               text.includes('start passport') ||
+                               text.includes('security check completed') ||
+                               text.includes('verification successful') ||
+                               window.location.href.includes('visa.vfsglobal.com');
+                    }""",
+                    timeout=180000,  # 3 minutes
+                )
+                logger.info("Face liveness check completed")
+            except Exception:
+                logger.warning("Face liveness timeout (3 min)")
+                await self.browser.screenshot("idv_face_timeout")
+
+            await self.browser.screenshot("idv_step2_face_done")
+
+            # Check if already redirected back (no passport step needed)
+            if "visa.vfsglobal.com" in page.url:
+                logger.info("Redirected back to VFS after face check")
+                return True, "Identity verification completed"
+
+            # ============================================================
+            # Step 3: "Start Passport Verification" page → click CONTINUE
+            # ============================================================
+            body_text = (await page.text_content("body") or "").lower()
+            if "passport verification" in body_text or "start passport" in body_text:
+                logger.info("'Start Passport Verification' page detected")
+                await self.browser.screenshot("idv_step3_passport_start")
+                await self.browser.random_delay(1000, 2000)
+
+                # Inject passport front photo BEFORE clicking Continue
+                # so the camera feed shows the passport when the camera activates
+                if passport_front:
+                    await self._inject_fake_camera(page, passport_front)
+                    logger.info("Passport front photo injected as camera feed (before Continue)")
+
+                await self._click_mui_continue(page, "Start Passport Verification")
+                await self.browser.random_delay(2000, 3000)
+
+                # ============================================================
+                # Step 4: Passport front — AUTO-DETECTION (no Capture button)
+                # Camera activates, system auto-scans for passport front.
+                # If it sees a face → "Verification terminated" → RETRY
+                # If it detects passport → moves to Step 2 automatically
+                # ============================================================
+                logger.info("Step 1: Display front of passport — waiting for auto-detection...")
+                await self.browser.screenshot("idv_step4_passport_front_camera")
+
+                # Re-inject passport front after camera activates (camera stream may reset)
+                if passport_front:
                     await asyncio.sleep(2)
-                    await self._inject_fake_camera(page, face_photo)
-                    logger.info("Face photo injected as camera feed for liveness check")
+                    await self._inject_fake_camera(page, passport_front)
+                    logger.info("Re-injected passport front photo after camera activation")
 
-                # Wait for face liveness to complete (look for passport step or completion)
-                logger.info("Waiting for face liveness check (up to 2 minutes)...")
-                try:
-                    await page.wait_for_function(
-                        """() => {
-                            const text = document.body?.innerText?.toLowerCase() || '';
-                            return text.includes('photo accepted') ||
-                                   text.includes('passport verification') ||
-                                   text.includes('start passport') ||
-                                   text.includes('security check completed') ||
-                                   window.location.href.includes('visa.vfsglobal.com');
-                        }""",
-                        timeout=120000,
-                    )
-                except:
-                    logger.warning("Face liveness timeout (2 min)")
-                    await self.browser.screenshot("face_liveness_timeout")
-
-                await self.browser.screenshot("after_face_check")
-
-                # Step 3: If we're at passport verification, inject passport photos
-                body_text = await page.text_content("body") or ""
-                if "passport verification" in body_text.lower() or "start passport" in body_text.lower():
-                    logger.info("Passport verification step detected")
-
-                    # Click Continue to start passport capture
+                # Wait for either: "Passport Detected!" / Step 2 / "Verification terminated"
+                max_retries = 3
+                for attempt in range(max_retries):
                     try:
-                        continue_btn = await page.query_selector("button:has-text('CONTINUE'), button:has-text('Continue')")
-                        if continue_btn:
-                            await continue_btn.click()
-                            await self.browser.random_delay(2000, 3000)
-                    except:
-                        pass
-
-                    # Inject passport front photo
-                    if passport_front:
-                        await asyncio.sleep(2)
-                        await self._inject_fake_camera(page, passport_front)
-                        logger.info("Passport front photo injected as camera feed")
-
-                    # Wait for passport front to be detected
-                    try:
-                        await page.wait_for_function(
+                        result = await page.wait_for_function(
                             """() => {
                                 const text = document.body?.innerText?.toLowerCase() || '';
-                                return text.includes('passport detected') ||
-                                       text.includes('step 2') ||
-                                       text.includes('photo page');
+                                if (text.includes('passport detected')) return 'detected';
+                                if (text.includes('step 2')) return 'step2';
+                                if (text.includes('open passport')) return 'step2';
+                                if (text.includes('verification terminated')) return 'terminated';
+                                if (text.includes('security check')) return 'done';
+                                if (window.location.href.includes('visa.vfsglobal.com')) return 'done';
+                                return false;
                             }""",
                             timeout=60000,
                         )
-                    except:
-                        logger.warning("Passport front detection timeout")
+                        status = await result.json_value() if result else "timeout"
+                    except Exception:
+                        status = "timeout"
 
-                    await self.browser.screenshot("after_passport_front")
+                    logger.info(f"Passport front detection result: {status} (attempt {attempt + 1})")
+                    await self.browser.screenshot(f"idv_step4_result_{status}_{attempt}")
 
-                    # Inject passport photo page
-                    if passport_page:
-                        await asyncio.sleep(2)
-                        await self._inject_fake_camera(page, passport_page)
-                        logger.info("Passport photo page injected as camera feed")
+                    if status == "terminated":
+                        # "Verification terminated" — click RETRY
+                        logger.warning("Verification terminated — clicking RETRY")
+                        try:
+                            retry_btn = await page.wait_for_selector(
+                                "button:has-text('RETRY'), button:has-text('Retry')",
+                                timeout=5000,
+                            )
+                            if retry_btn and await retry_btn.is_visible():
+                                # Re-inject passport photo before retrying
+                                if passport_front:
+                                    await self._inject_fake_camera(page, passport_front)
+                                await retry_btn.click()
+                                logger.info("Clicked RETRY")
+                                await self.browser.random_delay(2000, 3000)
+                                # Re-inject again after retry resets camera
+                                if passport_front:
+                                    await asyncio.sleep(2)
+                                    await self._inject_fake_camera(page, passport_front)
+                                continue  # Try again
+                        except Exception:
+                            logger.warning("Could not click RETRY button")
+                            break
+                    else:
+                        # detected / step2 / done — proceed
+                        break
 
-                    # Click CAPTURE button if visible (10-second countdown)
-                    try:
-                        capture_btn = await page.query_selector("button:has-text('CAPTURE'), button:has-text('Capture')")
-                        if capture_btn:
-                            await capture_btn.click()
-                            logger.info("Clicked CAPTURE for passport photo page")
-                            await asyncio.sleep(12)  # Wait for 10-second countdown
-                    except:
-                        pass
+                await self.browser.screenshot("idv_step4_front_done")
 
-                    await self.browser.screenshot("after_passport_page")
+                # ============================================================
+                # Step 5: Passport photo page — click CAPTURE (10s countdown)
+                # After Step 1 succeeds, shows "Passport Detected!" then
+                # "Step 2: Open passport to display the photo page"
+                # User must click CAPTURE to start 10-second countdown
+                # ============================================================
+                if "visa.vfsglobal.com" not in page.url:
+                    body_text = (await page.text_content("body") or "").lower()
+                    if ("step 2" in body_text or "photo page" in body_text or
+                            "open passport" in body_text or "passport detected" in body_text):
+                        logger.info("Step 2: Passport photo page — looking for CAPTURE button...")
+                        await self.browser.screenshot("idv_step5_photo_page")
 
-                # Step 4: Wait for security check to complete
+                        # Inject passport photo page as camera feed
+                        if passport_page:
+                            await asyncio.sleep(1)
+                            await self._inject_fake_camera(page, passport_page)
+                            logger.info("Passport photo page injected as camera feed")
+
+                        # Click CAPTURE button to start 10-second countdown
+                        try:
+                            capture_btn = await page.wait_for_selector(
+                                "button:has-text('CAPTURE'), button:has-text('Capture')",
+                                timeout=15000,
+                            )
+                            if capture_btn and await capture_btn.is_visible():
+                                # Re-inject right before capture to ensure fresh feed
+                                if passport_page:
+                                    await self._inject_fake_camera(page, passport_page)
+                                await capture_btn.click()
+                                logger.info("Clicked CAPTURE — 10 second countdown started")
+                                # Wait for 10-second countdown to complete
+                                await asyncio.sleep(12)
+                        except Exception as e:
+                            logger.warning(f"CAPTURE button not found: {e}")
+
+                        await self.browser.screenshot("idv_step5_after_capture")
+
+                        # Wait for photo page capture to complete
+                        try:
+                            await page.wait_for_function(
+                                """() => {
+                                    const text = document.body?.innerText?.toLowerCase() || '';
+                                    return text.includes('security check') ||
+                                           text.includes('verification successful') ||
+                                           text.includes('verified') ||
+                                           text.includes('processing') ||
+                                           window.location.href.includes('visa.vfsglobal.com');
+                                }""",
+                                timeout=60000,
+                            )
+                        except Exception:
+                            logger.warning("Photo page capture completion timeout")
+
+                        await self.browser.screenshot("idv_step5_done")
+
+            # ============================================================
+            # Step 6: Wait for verification to complete (up to 5 minutes)
+            # ============================================================
+            if "idnvui.vfsglobal.com" in page.url:
                 logger.info("Waiting for identity verification to complete (up to 5 minutes)...")
                 try:
                     await page.wait_for_function(
                         """() => {
                             const text = document.body?.innerText?.toLowerCase() || '';
-                            if (text.includes('security check completed')) return true;
-                            if (window.location.href.includes('visa.vfsglobal.com')) return true;
-                            return false;
+                            return text.includes('security check completed') ||
+                                   text.includes('verification successful') ||
+                                   text.includes('verified successfully') ||
+                                   window.location.href.includes('visa.vfsglobal.com');
                         }""",
                         timeout=300000,  # 5 minutes
                     )
-                except:
+                    logger.info("Verification completed!")
+                except Exception:
                     logger.warning("Identity verification timeout (5 min)")
-                    await self.browser.screenshot("verification_timeout")
+                    await self.browser.screenshot("idv_timeout")
                     return False, "Identity verification timeout"
 
                 # Click Continue to redirect back to VFS
                 if "idnvui.vfsglobal.com" in page.url:
-                    try:
-                        continue_btn = await page.query_selector("button:has-text('CONTINUE'), button:has-text('Continue')")
-                        if continue_btn:
-                            await continue_btn.click()
-                            await self.browser.random_delay(3000, 5000)
-                    except:
-                        pass
+                    await self.browser.random_delay(1000, 2000)
+                    await self._click_mui_continue(page, "verification complete → back to VFS")
+                    await self.browser.random_delay(3000, 5000)
 
-                await self.browser.screenshot("verification_complete")
-                logger.info("Identity verification completed")
-                return True, "Identity verification completed"
-
-            else:
-                logger.info("No identity verification redirect detected")
-                return True, "No identity verification needed"
+            await self.browser.screenshot("idv_complete")
+            logger.info("Identity verification completed")
+            return True, "Identity verification completed"
 
         except Exception as e:
             logger.error(f"Identity verification error: {e}")
-            await self.browser.screenshot("verification_error")
+            await self.browser.screenshot("idv_error")
             return False, f"Identity verification error: {str(e)}"
 
     # ================================================================
