@@ -1071,6 +1071,15 @@ class BookingAutomation:
             except Exception as e:
                 logger.info(f"No Reminder modal: {e}")
 
+            # Step 3: Wait for page transition after save
+            # After Reminder modal Continue, the page should redirect to
+            # idnvui.vfsglobal.com (identity verification) or stay on VFS
+            logger.info("Waiting for page transition after save...")
+            await self.browser.random_delay(2000, 3000)
+
+            # Check current page state
+            current_url = page.url
+            logger.info(f"Current URL after save: {current_url}")
             await self.browser.screenshot("details_saved")
             logger.info("Applicant details saved successfully")
             return True, "Details saved"
@@ -1205,12 +1214,20 @@ class BookingAutomation:
             return False, "Browser not started"
 
         try:
-            logger.info("Checking for identity verification...")
-            await asyncio.sleep(3)
+            logger.info("Checking for identity verification redirect...")
 
-            # Check if redirected to identity verification domain
+            # Wait up to 15 seconds for potential redirect to idnvui.vfsglobal.com
+            # The redirect happens after Reminder modal Continue click
+            for i in range(15):
+                await asyncio.sleep(1)
+                if "idnvui.vfsglobal.com" in page.url:
+                    break
+                # Also check if the page content changed to show verification
+                if i == 5:
+                    logger.info(f"Still on: {page.url} (waiting for redirect...)")
+
             if "idnvui.vfsglobal.com" not in page.url:
-                logger.info("No identity verification redirect detected")
+                logger.info(f"No identity verification redirect detected (URL: {page.url})")
                 return True, "No identity verification needed"
 
             logger.info(f"Identity verification page detected: {page.url}")
@@ -2157,17 +2174,85 @@ class BookingAutomation:
             logger.warning(f"Could not fill date field {selector}: {e}")
 
     async def _select_dropdown(self, selector: str, value: str):
-        """Select value from Angular Material dropdown"""
+        """Select value from Angular Material dropdown (mat-select).
+
+        VFS uses app-dropdown > mat-select. Clicking mat-select opens a
+        cdk-overlay panel with mat-option elements.
+        """
         page = self.browser.page
         if not page:
             return
+
         try:
-            await self.browser.human_click(selector)
+            # Try to find and click the mat-select
+            el = await page.wait_for_selector(selector, timeout=5000)
+            if not el:
+                logger.warning(f"Dropdown not found: {selector}")
+                return
+
+            # Click to open the dropdown panel
+            await el.click()
             await self.browser.random_delay(500, 1000)
+
+            # Wait for the overlay panel with options
             option_selector = f"mat-option:has-text('{value}')"
-            await page.wait_for_selector(option_selector, timeout=5000)
-            await self.browser.human_click(option_selector)
+            try:
+                option = await page.wait_for_selector(option_selector, timeout=5000)
+                if option:
+                    await option.click()
+                    logger.info(f"Selected '{value}' from dropdown")
+                    await self.browser.random_delay(500, 1000)
+                    return
+            except Exception:
+                pass
+
+            # Fallback: try clicking the mat-select trigger area directly
+            logger.info(f"Retrying dropdown click for '{value}'...")
+            # Close any open overlay first
+            await page.keyboard.press("Escape")
+            await self.browser.random_delay(300, 500)
+
+            # Try clicking via the .mat-mdc-select-trigger inside the mat-select
+            trigger_sel = f"{selector} .mat-mdc-select-trigger"
+            try:
+                trigger = await page.query_selector(trigger_sel)
+                if trigger:
+                    await trigger.click()
+                else:
+                    await el.click()
+            except Exception:
+                await el.click()
+
             await self.browser.random_delay(500, 1000)
+
+            # Try finding option in the overlay container
+            try:
+                option = await page.wait_for_selector(
+                    f".cdk-overlay-container {option_selector}", timeout=5000
+                )
+                if option:
+                    await option.click()
+                    logger.info(f"Selected '{value}' from dropdown (via overlay)")
+                    await self.browser.random_delay(500, 1000)
+                    return
+            except Exception:
+                pass
+
+            # Last resort: use JS to select the value via Angular
+            logger.info(f"Trying JS selection for '{value}'...")
+            await page.evaluate(f"""(value) => {{
+                // Find all mat-options in the overlay
+                const options = document.querySelectorAll('mat-option');
+                for (const opt of options) {{
+                    if (opt.textContent.trim().includes(value)) {{
+                        opt.click();
+                        return true;
+                    }}
+                }}
+                return false;
+            }}""", value)
+            await self.browser.random_delay(500, 1000)
+
         except Exception as e:
             logger.warning(f"Could not select {value} from {selector}: {e}")
 
