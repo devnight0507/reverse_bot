@@ -294,14 +294,23 @@
         async function loadApplicants() {
             try {
                 const res = await fetch(`${API}/api/applicants`);
-                renderApplicants(await res.json());
+                const list = await res.json();
+                // Fetch face video counts in parallel
+                await Promise.all(list.map(async (a) => {
+                    try {
+                        const vr = await fetch(`${API}/api/applicants/${a.id}/face-videos`);
+                        const vd = await vr.json();
+                        a.face_video_count = vd.count || 0;
+                    } catch { a.face_video_count = 0; }
+                }));
+                renderApplicants(list);
             } catch (e) { console.error(e); }
         }
 
         function photoStatus(a) {
             const has = (p) => p ? 'text-emerald-500' : 'text-slate-300';
-            return `<div class="flex gap-1.5" title="Face / Front / Page">
-                <svg class="w-4 h-4 ${has(a.face_photo_path)}" fill="currentColor" viewBox="0 0 20 20"><path d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z"/></svg>
+            return `<div class="flex gap-1.5" title="Face Videos: ${a.face_video_count || 0} / Front / Page">
+                <svg class="w-4 h-4 ${has(a.face_video_count)}" fill="currentColor" viewBox="0 0 20 20"><path d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z"/></svg>
                 <svg class="w-4 h-4 ${has(a.passport_front_path)}" fill="currentColor" viewBox="0 0 20 20"><path d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4z"/></svg>
                 <svg class="w-4 h-4 ${has(a.passport_page_path)}" fill="currentColor" viewBox="0 0 20 20"><path d="M4 3a2 2 0 100 4h12a2 2 0 100-4H4zm12 8H4a2 2 0 100 4h12a2 2 0 100-4z"/></svg>
             </div>`;

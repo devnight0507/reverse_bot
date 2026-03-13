@@ -13,6 +13,7 @@ Full flow (from screenshots analysis):
 import asyncio
 import re
 from datetime import date, datetime
+from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Callable
 from urllib.parse import urlparse, parse_qs
 from playwright.async_api import Page
@@ -1007,7 +1008,7 @@ class BookingAutomation:
 
                     # Solve the Turnstile within the modal
                     from .turnstile import TurnstileSolver
-                    solver = TurnstileSolver(self.browser)
+                    solver = TurnstileSolver()
                     solved = await solver.solve(page)
 
                     if solved:
@@ -1146,7 +1147,6 @@ class BookingAutomation:
         The canvas stream replaces the real camera via navigator.mediaDevices.getUserMedia override.
         """
         import base64
-        from pathlib import Path
 
         fpath = Path(file_path)
         if not fpath.exists():
