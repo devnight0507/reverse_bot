@@ -145,30 +145,124 @@ async def upload_photo(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_session)
 ):
-    """Upload face/passport photo for identity verification.
-    photo_type: face_photo, passport_front, passport_page
+    """Upload face video or passport photo for identity verification.
+
+    photo_type: face_video (multiple allowed, stored in videos table), passport_front, passport_page
     """
     applicant = await crud.get_applicant(db, applicant_id)
     if not applicant:
         raise HTTPException(status_code=404, detail="Applicant not found")
 
-    if photo_type not in ("face_photo", "passport_front", "passport_page"):
-        raise HTTPException(status_code=400, detail="Invalid photo type")
+    valid_types = ("face_video", "passport_front", "passport_page")
+    if photo_type not in valid_types:
+        raise HTTPException(status_code=400, detail=f"Invalid photo type. Must be one of: {valid_types}")
 
-    # Save file
     uploads_dir = Path("data/uploads") / str(applicant_id)
-    uploads_dir.mkdir(parents=True, exist_ok=True)
+    ext = Path(file.filename).suffix or (".mp4" if photo_type == "face_video" else ".jpg")
 
-    ext = Path(file.filename).suffix or ".jpg"
-    file_path = uploads_dir / f"{photo_type}{ext}"
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    if photo_type == "face_video":
+        videos_dir = uploads_dir / "face_videos"
+        videos_dir.mkdir(parents=True, exist_ok=True)
+        existing_videos = await crud.get_videos_for_applicant(db, applicant_id)
+        idx = len(existing_videos) + 1
+        file_path = videos_dir / f"face_{idx}{ext}"
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
 
-    # Update applicant record
-    update_data = {f"{photo_type}_path": str(file_path)}
-    await crud.update_applicant(db, applicant_id, **update_data)
+        video = await crud.create_video(
+            db,
+            applicant_id=applicant_id,
+            file_path=str(file_path),
+            filename=f"face_{idx}{ext}",
+            file_type="face_video",
+            size_bytes=file_path.stat().st_size,
+        )
+        return {
+            "message": f"Face video #{idx} uploaded",
+            "path": str(file_path),
+            "video_id": video.id,
+            "total_videos": idx,
+        }
+    else:
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        file_path = uploads_dir / f"{photo_type}{ext}"
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
 
-    return {"message": f"{photo_type} uploaded", "path": str(file_path)}
+        update_data = {f"{photo_type}_path": str(file_path)}
+        await crud.update_applicant(db, applicant_id, **update_data)
+        return {"message": f"{photo_type} uploaded", "path": str(file_path)}
+
+
+@app.get("/api/applicants/{applicant_id}/face-videos")
+async def list_face_videos(applicant_id: int, db: AsyncSession = Depends(get_session)):
+    """List all uploaded face videos for an applicant (from videos table)"""
+    applicant = await crud.get_applicant(db, applicant_id)
+    if not applicant:
+        raise HTTPException(status_code=404, detail="Applicant not found")
+
+    videos = await crud.get_videos_for_applicant(db, applicant_id)
+    return {
+        "videos": [
+            {
+                "id": v.id,
+                "name": v.filename,
+                "path": v.file_path,
+                "size_kb": round(v.size_bytes / 1024) if v.size_bytes else 0,
+            }
+            for v in videos
+        ],
+        "count": len(videos),
+    }
+
+
+@app.delete("/api/applicants/{applicant_id}/face-videos")
+async def delete_face_videos(applicant_id: int, db: AsyncSession = Depends(get_session)):
+    """Delete all face videos for an applicant"""
+    applicant = await crud.get_applicant(db, applicant_id)
+    if not applicant:
+        raise HTTPException(status_code=404, detail="Applicant not found")
+
+    # Delete files from disk
+    videos_dir = Path("data/uploads") / str(applicant_id) / "face_videos"
+    if videos_dir.exists():
+        shutil.rmtree(videos_dir)
+
+    # Delete from DB
+    count = await crud.delete_videos_for_applicant(db, applicant_id)
+    return {"message": f"Deleted {count} face videos"}
+
+
+@app.delete("/api/applicants/{applicant_id}/face-videos/{video_id}")
+async def delete_face_video(applicant_id: int, video_id: int, db: AsyncSession = Depends(get_session)):
+    """Delete a single face video"""
+    videos = await crud.get_videos_for_applicant(db, applicant_id)
+    video = next((v for v in videos if v.id == video_id), None)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    # Delete file from disk
+    file_path = Path(video.file_path)
+    if file_path.exists():
+        file_path.unlink()
+
+    await crud.delete_video(db, video_id)
+    return {"message": f"Video {video.filename} deleted"}
+
+
+@app.get("/api/applicants/{applicant_id}/photo/{photo_type}")
+async def get_photo(applicant_id: int, photo_type: str, db: AsyncSession = Depends(get_session)):
+    """Serve an uploaded photo/video file"""
+    applicant = await crud.get_applicant(db, applicant_id)
+    if not applicant:
+        raise HTTPException(status_code=404, detail="Applicant not found")
+
+    path_field = f"{photo_type}_path"
+    file_path = getattr(applicant, path_field, None)
+    if not file_path or not Path(file_path).exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(file_path)
 
 
 # ============== Booking Routes ==============
@@ -262,7 +356,12 @@ _monitor = None
 
 
 def _applicant_to_dict(a) -> dict:
-    """Convert SQLAlchemy Applicant model to dict for monitor"""
+    """Convert SQLAlchemy Applicant model to dict for monitor.
+
+    Note: a.videos relationship must be loaded before calling this.
+    """
+    face_videos = [v.file_path for v in (a.videos or []) if v.file_type == "face_video"]
+
     return {
         "id": a.id,
         "first_name": a.first_name,
@@ -276,7 +375,8 @@ def _applicant_to_dict(a) -> dict:
         "gender": a.gender,
         "nationality": a.nationality,
         "visa_type": a.visa_type,
-        "face_photo_path": a.face_photo_path,
+        "face_videos": face_videos,
+        "face_photo_path": face_videos[0] if face_videos else None,
         "passport_front_path": a.passport_front_path,
         "passport_page_path": a.passport_page_path,
         "status": a.status,
@@ -309,8 +409,8 @@ async def _run_bot(applicant_dicts: list):
                 from ..services.notification import NotificationService
                 ns = NotificationService()
                 if event == "slot_found":
-                    dates = data.get("dates", [])
-                    await ns.notify_slot_found(dates if dates else [data.get("message", "Slots available!")])
+                    message = data.get("message", "Slots available!")
+                    await ns.notify_slot_found([message])
                 elif event == "booking_success":
                     applicant = data.get("applicant", {})
                     confirmation = data.get("confirmation", {})
@@ -441,18 +541,18 @@ async def start_bot(
     if bot_state["is_running"]:
         raise HTTPException(status_code=400, detail="Bot is already running")
 
-    # Load applicants from database
+    # Load applicants from database (with videos relationship)
     if request.applicant_ids:
         applicants = []
         for aid in request.applicant_ids:
-            a = await crud.get_applicant(db, aid)
+            a = await crud.get_applicant(db, aid, load_videos=True)
             if a and a.status not in ("booked", "cancelled"):
                 applicants.append(_applicant_to_dict(a))
         if not applicants:
             raise HTTPException(status_code=400, detail="No valid applicants found")
     else:
         # Load all pending applicants
-        all_applicants = await crud.get_applicants(db, status="pending")
+        all_applicants = await crud.get_applicants(db, status="pending", load_videos=True)
         applicants = [_applicant_to_dict(a) for a in all_applicants]
         if not applicants:
             raise HTTPException(status_code=400, detail="No pending applicants found")

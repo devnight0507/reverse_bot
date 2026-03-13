@@ -65,6 +65,22 @@ class ApplicantResponse(ApplicantBase):
         from_attributes = True
 
 
+# ============== Video Schemas ==============
+
+class VideoResponse(BaseModel):
+    """Schema for video response"""
+    id: int
+    applicant_id: int
+    file_path: str
+    filename: str
+    file_type: str
+    size_bytes: Optional[int]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 # ============== Booking Schemas ==============
 
 class BookingBase(BaseModel):

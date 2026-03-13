@@ -7,7 +7,7 @@ from sqlalchemy import select, update, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from .models import Applicant, Booking, BookingLog, Session, Settings
+from .models import Applicant, Booking, BookingLog, Session, Settings, Video
 
 
 # ============== Applicant CRUD ==============
@@ -21,11 +21,12 @@ async def create_applicant(db: AsyncSession, **kwargs) -> Applicant:
     return applicant
 
 
-async def get_applicant(db: AsyncSession, applicant_id: int) -> Optional[Applicant]:
+async def get_applicant(db: AsyncSession, applicant_id: int, load_videos: bool = False) -> Optional[Applicant]:
     """Get applicant by ID"""
-    result = await db.execute(
-        select(Applicant).where(Applicant.id == applicant_id)
-    )
+    query = select(Applicant).where(Applicant.id == applicant_id)
+    if load_videos:
+        query = query.options(selectinload(Applicant.videos))
+    result = await db.execute(query)
     return result.scalar_one_or_none()
 
 
@@ -41,13 +42,16 @@ async def get_applicants(
     db: AsyncSession,
     skip: int = 0,
     limit: int = 100,
-    status: Optional[str] = None
+    status: Optional[str] = None,
+    load_videos: bool = False
 ) -> List[Applicant]:
     """Get list of applicants"""
     query = select(Applicant).order_by(Applicant.priority.desc(), Applicant.created_at)
 
     if status:
         query = query.where(Applicant.status == status)
+    if load_videos:
+        query = query.options(selectinload(Applicant.videos))
 
     query = query.offset(skip).limit(limit)
     result = await db.execute(query)
@@ -81,6 +85,45 @@ async def count_applicants(db: AsyncSession, status: Optional[str] = None) -> in
         query = query.where(Applicant.status == status)
     result = await db.execute(query)
     return result.scalar() or 0
+
+
+# ============== Video CRUD ==============
+
+async def create_video(db: AsyncSession, **kwargs) -> Video:
+    """Create a new video record"""
+    video = Video(**kwargs)
+    db.add(video)
+    await db.commit()
+    await db.refresh(video)
+    return video
+
+
+async def get_videos_for_applicant(db: AsyncSession, applicant_id: int) -> List[Video]:
+    """Get all videos for an applicant"""
+    result = await db.execute(
+        select(Video)
+        .where(Video.applicant_id == applicant_id)
+        .order_by(Video.created_at)
+    )
+    return list(result.scalars().all())
+
+
+async def delete_video(db: AsyncSession, video_id: int) -> bool:
+    """Delete a video by ID"""
+    result = await db.execute(
+        delete(Video).where(Video.id == video_id)
+    )
+    await db.commit()
+    return result.rowcount > 0
+
+
+async def delete_videos_for_applicant(db: AsyncSession, applicant_id: int) -> int:
+    """Delete all videos for an applicant"""
+    result = await db.execute(
+        delete(Video).where(Video.applicant_id == applicant_id)
+    )
+    await db.commit()
+    return result.rowcount
 
 
 # ============== Booking CRUD ==============

@@ -35,9 +35,29 @@ class Applicant(Base):
 
     # Relationships
     bookings: Mapped[List["Booking"]] = relationship("Booking", back_populates="applicant", cascade="all, delete-orphan")
+    videos: Mapped[List["Video"]] = relationship("Video", back_populates="applicant", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Applicant {self.first_name} {self.last_name} ({self.passport_number})>"
+
+
+class Video(Base):
+    """Video model - stores face videos for identity verification (1:N with Applicant)"""
+    __tablename__ = "videos"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    applicant_id: Mapped[int] = mapped_column(Integer, ForeignKey("applicants.id"), nullable=False)
+    file_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_type: Mapped[str] = mapped_column(String(50), default="face_video")  # face_video
+    size_bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    # Relationships
+    applicant: Mapped["Applicant"] = relationship("Applicant", back_populates="videos")
+
+    def __repr__(self):
+        return f"<Video {self.filename} for Applicant {self.applicant_id}>"
 
 
 class Booking(Base):

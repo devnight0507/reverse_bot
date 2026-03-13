@@ -880,9 +880,10 @@ class BookingAutomation:
             await self._fill_input_by_label(page, "Last Name", applicant.get("last_name", ""))
             await self.browser.random_delay(300, 600)
 
-            # Gender dropdown (mat-select)
+            # Gender dropdown (mat-select — no formcontrolname, find by label)
             if applicant.get("gender"):
-                await self._select_dropdown(Selectors.GENDER_SELECT, applicant["gender"])
+                gender_sel = "app-dynamic-control:has(:text('Gender')) mat-select"
+                await self._select_dropdown(gender_sel, applicant["gender"])
                 await self.browser.random_delay(300, 600)
 
             # Date of Birth (ngb-datepicker with id="dateOfBirth")
@@ -890,9 +891,10 @@ class BookingAutomation:
                 await self._fill_ngb_date(page, "dateOfBirth", applicant["date_of_birth"])
                 await self.browser.random_delay(300, 600)
 
-            # Nationality dropdown (mat-select)
+            # Nationality dropdown (mat-select — no formcontrolname, find by label)
             if applicant.get("nationality"):
-                await self._select_dropdown(Selectors.NATIONALITY_SELECT, applicant["nationality"])
+                nationality_sel = "app-dynamic-control:has(:text('Nationality')) mat-select"
+                await self._select_dropdown(nationality_sel, applicant["nationality"])
                 await self.browser.random_delay(300, 600)
 
             # Passport Number
@@ -904,11 +906,22 @@ class BookingAutomation:
                 await self._fill_ngb_date(page, "passportExpirtyDate", applicant["passport_expiry"])
                 await self.browser.random_delay(300, 600)
 
-            # Contact number: dial code input + phone number input
-            # Dial code is a small input (maxlength=3, placeholder="44")
-            dial_code = applicant.get("dial_code", "+244")
-            # Strip the + for the dial code field
-            dial_digits = dial_code.lstrip("+")
+            # Contact number: dial code input + phone number input (two separate fields)
+            # Dial code field: small input (maxlength=3, placeholder="44") — just the digits
+            # Phone field: larger input (maxlength=15, placeholder="012345648382") — just the number
+            dial_code = applicant.get("dial_code", "+244").lstrip("+")
+            phone = applicant.get("phone", "")
+
+            # Strip dial code prefix from phone number if present
+            # e.g., "+244947349423" → "947349423", "244947349423" → "947349423"
+            phone_clean = phone.lstrip("+")
+            if phone_clean.startswith(dial_code):
+                phone_clean = phone_clean[len(dial_code):]
+            # Also strip leading zeros that might appear
+            phone_clean = phone_clean.lstrip("0") if phone_clean.startswith("0") else phone_clean
+
+            logger.info(f"Contact: dial_code={dial_code}, phone={phone_clean} (raw: {phone})")
+
             try:
                 dial_el = await page.wait_for_selector(
                     "input[placeholder='44'], input[maxlength='3']", timeout=3000
@@ -916,14 +929,12 @@ class BookingAutomation:
                 if dial_el:
                     await dial_el.click()
                     await dial_el.fill("")
-                    await page.keyboard.type(dial_digits, delay=50)
-                    logger.info(f"Filled dial code = {dial_digits}")
+                    await page.keyboard.type(dial_code, delay=50)
+                    logger.info(f"Filled dial code = {dial_code}")
             except Exception as e:
                 logger.warning(f"Could not fill dial code: {e}")
             await self.browser.random_delay(200, 400)
 
-            # Phone number (larger input, maxlength=15)
-            phone = applicant.get("phone", "")
             try:
                 phone_el = await page.wait_for_selector(
                     "input[maxlength='15'], input[placeholder*='012345']", timeout=3000
@@ -931,8 +942,8 @@ class BookingAutomation:
                 if phone_el:
                     await phone_el.click()
                     await phone_el.fill("")
-                    await page.keyboard.type(phone, delay=30)
-                    logger.info(f"Filled phone = {phone}")
+                    await page.keyboard.type(phone_clean, delay=30)
+                    logger.info(f"Filled phone = {phone_clean}")
             except Exception as e:
                 logger.warning(f"Could not fill phone: {e}")
             await self.browser.random_delay(300, 600)
@@ -1124,55 +1135,120 @@ class BookingAutomation:
     # Phase 7: Identity Verification (delegated)
     # ================================================================
 
-    async def _inject_fake_camera(self, page, image_path: str) -> bool:
-        """Override getUserMedia to serve a static image as fake camera feed.
-        This converts the image to a canvas stream that the verification page sees as a webcam.
+    async def _inject_fake_camera(self, page, file_path: str) -> bool:
+        """Override getUserMedia to serve a video or image as fake camera feed.
+
+        For VIDEO files (.mp4, .webm): creates a hidden <video> element, plays it
+        in a loop, and draws frames to canvas → captureStream.
+
+        For IMAGE files (.jpg, .png): draws the static image to canvas → captureStream.
+
+        The canvas stream replaces the real camera via navigator.mediaDevices.getUserMedia override.
         """
         import base64
         from pathlib import Path
 
-        img_path = Path(image_path)
-        if not img_path.exists():
-            logger.warning(f"Image not found for fake camera: {image_path}")
+        fpath = Path(file_path)
+        if not fpath.exists():
+            logger.warning(f"File not found for fake camera: {file_path}")
             return False
 
-        with open(img_path, "rb") as f:
+        with open(fpath, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
 
-        ext = img_path.suffix.lower()
-        mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
+        ext = fpath.suffix.lower()
+        is_video = ext in (".mp4", ".webm", ".ogg", ".mkv")
 
-        js = f"""
-        (function() {{
-            const dataUrl = 'data:{mime};base64,{b64}';
-            const img = new Image();
-            img.src = dataUrl;
-            img.onload = function() {{
+        if is_video:
+            mime = {".mp4": "video/mp4", ".webm": "video/webm", ".ogg": "video/ogg"}.get(ext, "video/mp4")
+            js = f"""
+            (function() {{
+                // Create hidden video element
+                const video = document.createElement('video');
+                video.src = 'data:{mime};base64,{b64}';
+                video.loop = true;
+                video.muted = true;
+                video.playsInline = true;
+                video.style.display = 'none';
+                document.body.appendChild(video);
+
                 const canvas = document.createElement('canvas');
-                canvas.width = img.width;
-                canvas.height = img.height;
                 const ctx = canvas.getContext('2d');
-                ctx.drawImage(img, 0, 0);
 
-                const stream = canvas.captureStream(30);
-                const origGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+                video.addEventListener('loadedmetadata', function() {{
+                    canvas.width = video.videoWidth || 640;
+                    canvas.height = video.videoHeight || 480;
+                    video.play();
+                }});
 
-                navigator.mediaDevices.getUserMedia = function(constraints) {{
-                    if (constraints && constraints.video) {{
-                        return Promise.resolve(stream);
+                video.addEventListener('play', function() {{
+                    const stream = canvas.captureStream(30);
+
+                    // Add audio track if present
+                    const videoStream = video.captureStream ? video.captureStream() : null;
+                    if (videoStream) {{
+                        const audioTracks = videoStream.getAudioTracks();
+                        audioTracks.forEach(t => stream.addTrack(t));
                     }}
-                    return origGetUserMedia(constraints);
-                }};
 
-                // Also keep redrawing to keep the stream alive
-                setInterval(() => {{ ctx.drawImage(img, 0, 0); }}, 100);
-            }};
-            window.__fakeCameraActive = true;
-        }})();
-        """
+                    // Override getUserMedia
+                    const origGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+                    navigator.mediaDevices.getUserMedia = function(constraints) {{
+                        if (constraints && constraints.video) {{
+                            return Promise.resolve(stream);
+                        }}
+                        return origGetUserMedia(constraints);
+                    }};
+
+                    // Keep drawing video frames to canvas
+                    function drawFrame() {{
+                        if (!video.paused && !video.ended) {{
+                            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                        }}
+                        requestAnimationFrame(drawFrame);
+                    }}
+                    drawFrame();
+                }});
+
+                video.play().catch(e => console.warn('Video autoplay failed:', e));
+                window.__fakeCameraActive = true;
+                window.__fakeCameraVideo = video;
+            }})();
+            """
+        else:
+            mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
+            js = f"""
+            (function() {{
+                const dataUrl = 'data:{mime};base64,{b64}';
+                const img = new Image();
+                img.src = dataUrl;
+                img.onload = function() {{
+                    const canvas = document.createElement('canvas');
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0);
+
+                    const stream = canvas.captureStream(30);
+                    const origGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+
+                    navigator.mediaDevices.getUserMedia = function(constraints) {{
+                        if (constraints && constraints.video) {{
+                            return Promise.resolve(stream);
+                        }}
+                        return origGetUserMedia(constraints);
+                    }};
+
+                    // Keep redrawing to keep stream alive
+                    setInterval(() => {{ ctx.drawImage(img, 0, 0); }}, 100);
+                }};
+                window.__fakeCameraActive = true;
+            }})();
+            """
         try:
             await page.evaluate(js)
-            logger.info(f"Injected fake camera with image: {img_path.name}")
+            media_type = "video" if is_video else "image"
+            logger.info(f"Injected fake camera with {media_type}: {fpath.name}")
             return True
         except Exception as e:
             logger.error(f"Failed to inject fake camera: {e}")
@@ -1233,66 +1309,134 @@ class BookingAutomation:
             logger.info(f"Identity verification page detected: {page.url}")
             await self.browser.screenshot("idv_start")
 
-            # Check if applicant has uploaded photos
-            face_photo = applicant.get("face_photo_path") if applicant else None
+            # Check if applicant has uploaded files
+            face_videos = applicant.get("face_videos", []) if applicant else []
+            # Fallback: single face_photo_path (legacy)
+            if not face_videos:
+                face_photo = applicant.get("face_photo_path") if applicant else None
+                if face_photo:
+                    face_videos = [face_photo]
             passport_front = applicant.get("passport_front_path") if applicant else None
             passport_page = applicant.get("passport_page_path") if applicant else None
-            has_photos = face_photo or passport_front or passport_page
+            has_photos = len(face_videos) > 0 or passport_front or passport_page
 
             if has_photos:
-                logger.info("Applicant has uploaded ID photos - will attempt auto-verification")
+                logger.info(f"Applicant has {len(face_videos)} face video(s), "
+                            f"passport_front={'yes' if passport_front else 'no'}, "
+                            f"passport_page={'yes' if passport_page else 'no'}")
             else:
-                logger.info("No uploaded photos - waiting for manual verification")
+                logger.info("No uploaded photos/videos - waiting for manual verification")
 
             # ============================================================
-            # Step 1: "Start Identity Verification" page → click CONTINUE
+            # Step 1+2: Face liveness check — cycle through videos on failure
             # ============================================================
-            try:
-                await page.wait_for_selector(
-                    "h1:has-text('Start Identity Verification'), "
-                    "h1:has-text('Identity Verification')",
-                    timeout=15000,
-                )
-                logger.info("'Start Identity Verification' page loaded")
-                await self.browser.screenshot("idv_step1_start")
-                await self.browser.random_delay(1000, 2000)
+            face_liveness_passed = False
+            for video_idx, face_video in enumerate(face_videos or [None]):
+                video_num = video_idx + 1
+                total_videos = len(face_videos)
 
-                await self._click_mui_continue(page, "Start Identity Verification")
-                await self.browser.random_delay(2000, 3000)
-            except Exception as e:
-                logger.warning(f"Start Identity Verification page not detected: {e}")
+                if face_video:
+                    logger.info(f"Face liveness attempt {video_num}/{total_videos}: {Path(face_video).name}")
+                else:
+                    logger.info("No face video — waiting for manual liveness check")
 
-            # ============================================================
-            # Step 2: Face liveness check (camera: "Move face in front of camera")
-            # ============================================================
-            logger.info("Face liveness check - camera should be active...")
-            await self.browser.screenshot("idv_step2_face_camera")
+                # Wait for "Start Identity Verification" page
+                try:
+                    await page.wait_for_selector(
+                        "h1:has-text('Start Identity Verification'), "
+                        "h1:has-text('Identity Verification')",
+                        timeout=15000,
+                    )
+                    logger.info("'Start Identity Verification' page loaded")
+                    await self.browser.screenshot(f"idv_face_attempt_{video_num}")
+                    await self.browser.random_delay(1000, 2000)
 
-            # If we have a face photo, inject it as fake camera
-            if face_photo:
-                await asyncio.sleep(2)
-                await self._inject_fake_camera(page, face_photo)
-                logger.info("Face photo injected as camera feed")
+                    # Inject fake camera BEFORE clicking Continue
+                    if face_video:
+                        await self._inject_fake_camera(page, face_video)
+                        logger.info(f"Injected face video #{video_num} as camera")
 
-            # Wait for face check to complete → "Start Passport Verification" appears
-            # or security check completed, or redirected back to VFS
-            logger.info("Waiting for face liveness to complete (up to 3 minutes)...")
-            try:
-                await page.wait_for_function(
-                    """() => {
-                        const text = document.body?.innerText?.toLowerCase() || '';
-                        return text.includes('passport verification') ||
-                               text.includes('start passport') ||
-                               text.includes('security check completed') ||
-                               text.includes('verification successful') ||
-                               window.location.href.includes('visa.vfsglobal.com');
-                    }""",
-                    timeout=180000,  # 3 minutes
-                )
-                logger.info("Face liveness check completed")
-            except Exception:
-                logger.warning("Face liveness timeout (3 min)")
-                await self.browser.screenshot("idv_face_timeout")
+                    await self._click_mui_continue(page, "Start Identity Verification")
+                    await self.browser.random_delay(2000, 3000)
+                except Exception as e:
+                    logger.warning(f"Start Identity Verification not found: {e}")
+
+                # Face liveness check — camera active
+                logger.info("Face liveness check - camera should be active...")
+                await self.browser.screenshot("idv_step2_face_camera")
+
+                # Re-inject in case page reset the override
+                if face_video:
+                    await asyncio.sleep(1)
+                    await self._inject_fake_camera(page, face_video)
+
+                # Wait for result (up to 90 seconds per attempt)
+                logger.info(f"Waiting for face liveness result (attempt {video_num})...")
+                try:
+                    result = await page.wait_for_function(
+                        """() => {
+                            const text = document.body?.innerText?.toLowerCase() || '';
+                            if (text.includes('passport verification') ||
+                                text.includes('start passport') ||
+                                text.includes('security check completed') ||
+                                text.includes('verification successful')) return 'passed';
+                            if (text.includes('verification failed') ||
+                                text.includes('liveness failed') ||
+                                text.includes('try again')) return 'failed';
+                            if (window.location.href.includes('visa.vfsglobal.com')) return 'redirect';
+                            return null;
+                        }""",
+                        timeout=90000,
+                    )
+                    result_val = await result.json_value() if result else None
+                except Exception:
+                    result_val = None
+                    logger.warning("Face liveness timeout (90s)")
+
+                await self.browser.screenshot(f"idv_face_result_{video_num}")
+
+                if result_val == "passed" or result_val == "redirect":
+                    logger.info(f"Face liveness PASSED with video #{video_num}")
+                    face_liveness_passed = True
+                    break
+                elif result_val == "failed" and video_idx < total_videos - 1:
+                    logger.warning(f"Face liveness FAILED with video #{video_num} — trying next video")
+                    # Look for a retry/try again button
+                    for retry_sel in [
+                        "button:has-text('Try Again')", "button:has-text('RETRY')",
+                        "button:has-text('Retry')", "button:has-text('Start Over')",
+                    ]:
+                        try:
+                            btn = await page.query_selector(retry_sel)
+                            if btn and await btn.is_visible():
+                                await btn.click()
+                                logger.info("Clicked retry for next video attempt")
+                                await self.browser.random_delay(2000, 3000)
+                                break
+                        except Exception:
+                            continue
+                    continue  # Try next video
+                else:
+                    logger.warning(f"Face liveness result: {result_val} (video #{video_num})")
+                    break
+
+            if not face_liveness_passed and not face_videos:
+                # No videos — wait for manual completion (up to 3 min)
+                logger.info("Waiting for manual face liveness (up to 3 min)...")
+                try:
+                    await page.wait_for_function(
+                        """() => {
+                            const text = document.body?.innerText?.toLowerCase() || '';
+                            return text.includes('passport verification') ||
+                                   text.includes('security check completed') ||
+                                   window.location.href.includes('visa.vfsglobal.com');
+                        }""",
+                        timeout=180000,
+                    )
+                    face_liveness_passed = True
+                except Exception:
+                    logger.warning("Manual face liveness timeout")
+                    await self.browser.screenshot("idv_face_manual_timeout")
 
             await self.browser.screenshot("idv_step2_face_done")
 
